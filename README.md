@@ -23,6 +23,24 @@ Everything the plugin does goes through Claude Code's own engine API; it opens n
 - **Files.** The plugin reads `MEMORY.md` at the path the engine reports for the session's auto memory. It writes nothing to disk itself; its state lives in the engine's `$.state` (this session) and `$.store` (the per-session on/off choices and the default for new sessions).
 - **Environment.** It reads `CLAUDE_CODE_USE_*`, `CLAUDE_CODE_DISABLE_1M_CONTEXT` and `ANTHROPIC_DEFAULT_*_MODEL` to size context windows, and sets nothing.
 
+## How it hooks into Claude Code
+
+The plugin is a mod: a hooks module that registers on engine events. This is every hook and what it does, so the behaviour is visible before installing.
+
+| Hook | What it does |
+| --- | --- |
+| `session.start` | Registers the three worker agent types (`model-balance:haiku-worker`, `sonnet-worker`, `opus-worker`), the `mcp__model-balance__ask_user` tool and the `/model-balance` command. |
+| `command.run` for `/model-balance` | Answers the command itself: switches routing for this session or the default, or prints the status or context report. |
+| `prompt.submit` | On a human-typed prompt while routing is on: strips a `#tier` prefix and attaches a routing note to the model's context. The prompt text is otherwise passed on as typed; nothing is dropped. |
+| `agent.spawn` for a worker type | Rewrites the worker's prompt to add the conversation excerpt and the memory index, and sets its model to the tier's alias. Refuses a second top-level worker while one is still running. Spawns of any other agent type pass through unchanged. |
+| `tool.call` for `Edit`, `Write`, `NotebookEdit` | Refuses these to the main conversation on a routed turn, except inside the auto-memory directory, so the worker does the editing. The user bypasses this with `#main`. Subagents' calls pass through unchanged. |
+| `tool.call` for `mcp__model-balance__ask_user` | Implements the plugin's own tool: when a worker calls it, the plugin calls `AskUserQuestion` on the worker's behalf (subagents cannot call it themselves), waits for the dialog and returns the answers as the tool result. This is the only tool the plugin calls itself, and only in answer to a worker's call. |
+| `turn.step` | Gives a worker's requests the same effort setting as the main conversation; records each agent's usage for the context band. |
+| `turn.complete`, `session.measure` | Record a finished worker's context figures and the main conversation's context fill; show a toast when a worker finishes. |
+| `ui.render` for `AbovePrompt` | Draws the context band above the prompt while routing is on. |
+
+It never changes permission modes, permission decisions, settings, Remote Control or the system prompt, and it does not read or send any credential. The environment variables it reads (`CLAUDE_CODE_USE_*`, `CLAUDE_CODE_DISABLE_1M_CONTEXT`, `ANTHROPIC_DEFAULT_*_MODEL`) hold provider switches and model names, not secrets.
+
 ## Requirements
 
 - Claude Code v2.1.290 or later. The plugin is a mod (a hooks module with `$.state`), which older releases do not load.

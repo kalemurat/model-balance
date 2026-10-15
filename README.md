@@ -14,6 +14,15 @@ A Claude Code plugin that routes each prompt to a Haiku, Sonnet or Opus worker s
 
 Routing applies to prompts typed by a person (composer, bridge and SDK origins). Notifications, peer messages, scheduled runs and other plugins' prompts pass through untouched. Prompts shorter than 16 characters and prompts starting with `/` are not routed.
 
+## What it reads and sends
+
+Everything the plugin does goes through Claude Code's own engine API; it opens no network connection, runs no process and writes no file of its own.
+
+- **Classifier call.** One `haiku` model request per routed prompt, sent to the same provider the session uses (Anthropic API, Bedrock, Vertex or Foundry). It carries the prompt text (first 6,000 characters), an excerpt of the last four messages (last 3,000 characters) and, when a worker exists, the first 1,500 characters of that worker's task.
+- **Worker input.** Each worker is a subagent started through the Agent tool. Its prompt carries the task, an excerpt of the main conversation (up to 20 messages, 1,500 characters each, 24,000 in total, tool results excluded) and the first 200 lines or 25 KB of the auto-memory `MEMORY.md`. The worker reads memory files from that directory with Read.
+- **Files.** The plugin reads `MEMORY.md` at the path the engine reports for the session's auto memory. It writes nothing to disk itself; its state lives in the engine's `$.state` (this session) and `$.store` (the per-session on/off choices and the default for new sessions).
+- **Environment.** It reads `CLAUDE_CODE_USE_*`, `CLAUDE_CODE_DISABLE_1M_CONTEXT` and `ANTHROPIC_DEFAULT_*_MODEL` to size context windows, and sets nothing.
+
 ## Requirements
 
 - Claude Code v2.1.290 or later. The plugin is a mod (a hooks module with `$.state`), which older releases do not load.

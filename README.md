@@ -16,8 +16,9 @@ Routing applies to prompts typed by a person (composer, bridge and SDK origins).
 
 ## Requirements
 
-- Claude Code with plugin support.
+- Claude Code v2.1.290 or later. The plugin is a mod (a hooks module with `$.state`), which older releases do not load.
 - Model access for Haiku, Sonnet and Opus.
+- A machine whose managed settings allow user-installed mods. Under `allowManagedModsOnly`, `allowManagedHooksOnly` or `disableAllHooks`, the plugin's hooks do not run.
 
 ## Installation
 
@@ -36,7 +37,7 @@ claude plugin install model-balance@model-balance
 
 ## Usage
 
-Routing is switched on and off per session. Use the `/model-balance` command:
+Routing starts **off** on a fresh install. Turn it on for the current session with `/model-balance on`, or for every new session with `/model-balance default on`. Each session keeps its own setting:
 
 | Command | Effect |
 | --- | --- |
@@ -68,6 +69,7 @@ An explicit tier always starts a fresh worker. Only the classifier can decide th
 ## Limitations
 
 - Routing depends on the Haiku classifier. A wrong verdict sends the prompt to a tier that is too small or too large; use the `#tier` prefix to override it.
+- The router fails open. If one of its hooks fails (an engine call rejects, a time budget runs out), the prompt goes to the main model as typed and the status line says `router failed`; a worker whose preparation failed starts without the conversation excerpt and memory index.
 - The continuation check reads the last worker's task. A long gap between follow-ups can make the classifier start a new worker instead.
 
 ## License

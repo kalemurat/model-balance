@@ -31,6 +31,7 @@ import {
   parseVerdict,
   readOverride,
   readQuestions,
+  readDefaultToggle,
   readSavedToggle,
   readToggleCommand,
   sessionToggleKey,
@@ -196,6 +197,12 @@ test('on/off switches this session, default on/off the sessions to come', async 
   expect(readToggleCommand('status')).toEqual({ scope: 'status', isUnknown: false })
   expect(readToggleCommand('default')).toEqual({ scope: 'status', isUnknown: true })
   expect(readToggleCommand('on please')).toEqual({ scope: 'status', isUnknown: true })
+
+  // A fresh install routes nothing until `default on` has been run.
+  expect(readDefaultToggle(undefined)).toBe(false)
+  expect(readDefaultToggle(false)).toBe(false)
+  expect(readDefaultToggle('true')).toBe(false)
+  expect(readDefaultToggle(true)).toBe(true)
 })
 
 test('saved session choices are read strictly and pruned past their TTL', async () => {

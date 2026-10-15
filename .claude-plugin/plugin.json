@@ -1,7 +1,11 @@
 {
   "name": "model-balance",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Routes each prompt to a Haiku, Sonnet or Opus worker subagent by its difficulty, whatever the main model is. Follow-ups continue the last worker, and the main model's file edits are refused on routed turns. Switched on and off per session, with a context band above the prompt.",
   "author": { "name": "Murat KALE" },
+  "homepage": "https://github.com/kalemurat/model-balance",
+  "repository": "https://github.com/kalemurat/model-balance",
+  "license": "MIT",
+  "keywords": ["routing", "subagents", "haiku", "sonnet", "opus", "context"],
   "types": "./types/index.d.ts"
 }

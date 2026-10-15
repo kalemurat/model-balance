@@ -33,6 +33,7 @@ import {
   pickLastWorker,
   pushRun,
   readAnswers,
+  readDefaultToggle,
   readOverride,
   readQuestions,
   readSavedToggle,
@@ -133,7 +134,7 @@ const MAX_TRACKED_AGENTS = 50
 const statusText = (isOn: boolean): string => (isOn ? 'model-balance: on' : 'model-balance: off')
 
 const readDefault = async ($: EngineInterface): Promise<boolean> =>
-  (await $.store.get(DEFAULT_TOGGLE_KEY)) !== false
+  readDefaultToggle(await $.store.get(DEFAULT_TOGGLE_KEY))
 
 const providerOf = async ($: EngineInterface): Promise<Provider> => {
   if (isSwitchOn(await $.env.get('CLAUDE_CODE_USE_BEDROCK')) || isSwitchOn(await $.env.get('CLAUDE_CODE_USE_MANTLE'))) {
@@ -424,6 +425,11 @@ export const register: Register = on => {
     })()
 
     return next({ ...e, text, context: [...(e.context ?? []), note] })
+  }).catch(($, e, next) => {
+    // The router failing must never cost the person their prompt: it goes to main as typed.
+    if (next.error.kind !== 're-entry') $.ui.status('model-balance → main (router failed)')
+
+    return next(e)
   })
 
   /** One top-level worker writes at a time: a second spawn while one runs is refused, whoever asks for it. */
@@ -456,6 +462,11 @@ export const register: Register = on => {
     }
 
     return started
+  }).catch(($, e, next) => {
+    // Preparing the worker failed: it still starts, on its tier's model, without the excerpt and memory index.
+    const tier = tierOfWorker(e.subagentType)
+
+    return next.called || tier === undefined ? next(e) : next({ ...e, model: tier })
   })
 
   /**
@@ -474,7 +485,11 @@ export const register: Register = on => {
     return {
       deny: `model-balance routed this request to a worker, so ${e.tool} is refused to the main conversation on this turn. Follow the routing note: hand the work to the worker. The user can prefix a prompt with #main to have the main conversation edit.`,
     }
-  })
+  }).catch(($, e, next) =>
+    // The guard keeps routing discipline, not safety: when it cannot judge, main keeps its editing tools
+    // rather than being locked out until the plugin is disabled.
+    next(e),
+  )
 
   /**
    * Subagents have no AskUserQuestion of their own (docs/sub-agents removes it from every subagent); this

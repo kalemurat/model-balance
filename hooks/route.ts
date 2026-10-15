@@ -157,6 +157,12 @@ export const readOverride = (
 /** `$.store` key of the on/off a new session starts with; the toggle was global under this key before it became per session. */
 export const DEFAULT_TOGGLE_KEY = 'enabled'
 
+/**
+ * The on/off a new session starts with, read from `$.store`: off until `/model-balance default on`
+ * has been run on this machine, so a fresh install routes nothing until the person asks it to.
+ */
+export const readDefaultToggle = (value: unknown): boolean => value === true
+
 const SESSION_TOGGLE_PREFIX = 'session:'
 
 /** A saved per-session choice older than this is dropped: the session is not going to be resumed. */

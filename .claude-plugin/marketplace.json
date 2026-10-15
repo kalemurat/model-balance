@@ -1,0 +1,6 @@
+{
+  "name": "model-balance",
+  "owner": { "name": "Murat KALE" },
+  "description": "Routes each prompt to a Haiku, Sonnet or Opus worker subagent by its difficulty.",
+  "plugins": [{ "name": "model-balance", "source": "./" }]
+}

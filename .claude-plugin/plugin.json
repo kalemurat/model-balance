@@ -1,11 +1,41 @@
 {
   "name": "model-balance",
-  "version": "0.6.0",
-  "description": "Routes each prompt to a Haiku, Sonnet or Opus worker subagent by its difficulty, whatever the main model is. Follow-ups continue the last worker, and the main model's file edits are refused on routed turns. Switched on and off per session, with a context band above the prompt.",
+  "version": "0.7.0",
+  "description": "Routes each prompt to the main conversation or to a Haiku, Sonnet or Opus worker subagent by its difficulty, whatever the main model is, each worker at its own effort and never at max. Main briefs each worker, follow-ups continue the last worker, and a board shows the running subagents with the finished ones behind a button. Switched on and off per session.",
   "author": { "name": "Murat KALE" },
   "homepage": "https://github.com/kalemurat/model-balance",
   "repository": "https://github.com/kalemurat/model-balance",
   "license": "MIT",
-  "keywords": ["routing", "subagents", "haiku", "sonnet", "opus", "context"],
-  "types": "./types/index.d.ts"
+  "keywords": ["routing", "subagents", "haiku", "sonnet", "opus", "context", "effort"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "router_model": {
+      "type": "string",
+      "title": "Router model",
+      "description": "Model that rates each prompt before routing it. Sonnet judges follow-ups and questions the main conversation can answer more reliably; Haiku answers faster. The other one stands in when it fails.",
+      "options": ["sonnet", "haiku"],
+      "default": "sonnet"
+    },
+    "haiku_effort": {
+      "type": "string",
+      "title": "Haiku worker effort",
+      "description": "Effort the Haiku worker runs at, set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
+      "options": ["low", "medium", "high", "xhigh", "session"],
+      "default": "medium"
+    },
+    "sonnet_effort": {
+      "type": "string",
+      "title": "Sonnet worker effort",
+      "description": "Effort the Sonnet worker runs at, set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
+      "options": ["low", "medium", "high", "xhigh", "session"],
+      "default": "high"
+    },
+    "opus_effort": {
+      "type": "string",
+      "title": "Opus worker effort",
+      "description": "Effort the Opus worker runs at, set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
+      "options": ["low", "medium", "high", "xhigh", "session"],
+      "default": "xhigh"
+    }
+  }
 }

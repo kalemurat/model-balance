@@ -1,6 +1,19 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  DEFAULT_WORKER_EFFORT,
+  agentLabel,
+  cappedSubagentEffort,
+  endStatusOf,
+  formatElapsed,
+  formatReports,
+  patchAgent,
+  pushReport,
+  readRouterModel,
+  readWorkerEffort,
+  restartAgent,
+  routerChain,
+  upsertAgent,
   MARK_CLOSE,
   contextBar,
   contextColor,
@@ -12,7 +25,6 @@ import {
   formatContextReport,
   formatTokens,
   percentOf,
-  pushRun,
   MARK_OPEN,
   excerptOf,
   clipMemoryIndex,
@@ -57,6 +69,8 @@ test('the classifier reply and model names map to tiers', async () => {
   expect(parseVerdict(' Sonnet.')).toBe('sonnet')
   expect(parseVerdict('no idea')).toBeUndefined()
   expect(parseVerdict('SONNET CONTINUE')).toBe('sonnet')
+  expect(parseVerdict('MAIN NEW')).toBe('main')
+  expect(parseVerdict('main')).toBe('main')
   expect(isContinuationReply('SONNET CONTINUE')).toBe(true)
   expect(isContinuationReply('opus new')).toBe(false)
   expect(isContinuationReply('HAIKU')).toBe(false)
@@ -69,6 +83,90 @@ test('the heuristic reads Turkish and English signals', async () => {
   expect(guessTier('şu metni özetle')).toBe('haiku')
   expect(guessTier('çevir bunu ingilizceye')).toBe('haiku')
   expect(guessTier('add a column to the users table')).toBe('sonnet')
+})
+
+test('the router is Sonnet unless Haiku is chosen, the other one standing in', async () => {
+  expect(readRouterModel(undefined)).toBe('sonnet')
+  expect(readRouterModel('opus')).toBe('sonnet')
+  expect(readRouterModel('haiku')).toBe('haiku')
+  expect(routerChain('sonnet')).toEqual(['sonnet', 'haiku'])
+  expect(routerChain('haiku')).toEqual(['haiku', 'sonnet'])
+})
+
+test('a worker effort is a level below max or session; max and unknown values fall back to the tier default', async () => {
+  expect(DEFAULT_WORKER_EFFORT).toEqual({ haiku: 'medium', sonnet: 'high', opus: 'xhigh' })
+  expect(readWorkerEffort(undefined, 'opus')).toBe('xhigh')
+  expect(readWorkerEffort('low', 'opus')).toBe('low')
+  expect(readWorkerEffort('session', 'haiku')).toBe('session')
+  expect(readWorkerEffort('max', 'sonnet')).toBe('high')
+  expect(readWorkerEffort('turbo', 'haiku')).toBe('medium')
+})
+
+test('a subagent request never runs at max', async () => {
+  expect(cappedSubagentEffort('max')).toBe('xhigh')
+  expect(cappedSubagentEffort('xhigh')).toBeUndefined()
+  expect(cappedSubagentEffort('low')).toBeUndefined()
+  expect(cappedSubagentEffort(undefined)).toBeUndefined()
+  expect(cappedSubagentEffort(32_000)).toBeUndefined()
+})
+
+test("the excerpt cuts main's messages shorter than the user's", async () => {
+  const long = 'x'.repeat(1200)
+  const excerpt = excerptOf([
+    { role: 'user', text: long, toolUses: [] },
+    { role: 'assistant', text: long, toolUses: [] },
+  ])
+
+  expect(excerpt).toContain(`USER: ${long}`)
+  expect(excerpt).toContain(`ASSISTANT: ${'x'.repeat(700)} …[500 chars cut]`)
+})
+
+test('a worker report is kept newest first, replaces its own earlier one and is clipped', async () => {
+  const report = (id: string, text: string) => ({ id, tier: 'sonnet' as const, description: `task ${id}`, report: text, at: 1 })
+  let reports = pushReport([], report('a', 'first'), 3)
+  reports = pushReport(reports, report('b', 'second'), 3)
+  reports = pushReport(reports, report('a', 'again'), 3)
+  expect(reports.map(one => [one.id, one.report])).toEqual([
+    ['a', 'again'],
+    ['b', 'second'],
+  ])
+  expect(pushReport([], report('c', 'y'.repeat(3000)), 3)[0]!.report).toContain('…[500 chars cut]')
+
+  expect(formatReports(reports, 1)).toBe('<report worker="sonnet" id="a" task="task a">\nagain\n</report>')
+  expect(formatReports([], 4)).toBe('')
+})
+
+test('board rows: elapsed time, labels, end status, upsert and restart', async () => {
+  expect(formatElapsed(45_400)).toBe('45s')
+  expect(formatElapsed(72_000)).toBe('1m 12s')
+  expect(formatElapsed(3_780_000)).toBe('1h 3m')
+  expect(formatElapsed(-5)).toBe('0s')
+  expect(agentLabel({ tier: 'opus', type: workerType('opus') })).toBe('opus worker')
+  expect(agentLabel({ type: 'Explore' })).toBe('Explore')
+  expect(endStatusOf('answer')).toBe('done')
+  expect(endStatusOf('aborted')).toBe('stopped')
+  expect(endStatusOf('error')).toBe('failed')
+
+  const row = (id: string) => ({
+    id,
+    type: workerType('haiku'),
+    tier: 'haiku' as const,
+    description: id,
+    status: 'running' as const,
+    startedAt: 0,
+    window: 1_000_000,
+  })
+  const rows = upsertAgent(upsertAgent([row('a')], row('b'), 2), row('c'), 2)
+  expect(rows.map(one => one.id)).toEqual(['c', 'b'])
+  expect(upsertAgent(rows, row('b'), 2).map(one => one.id)).toEqual(['b', 'c'])
+
+  const ended = patchAgent(rows, 'b', { status: 'done', endedAt: 9, outputTokens: 120 })
+  expect(ended.find(one => one.id === 'b')).toMatchObject({ status: 'done', endedAt: 9, outputTokens: 120 })
+  const again = restartAgent(ended, 'b', 50).find(one => one.id === 'b')!
+  expect(again.status).toBe('running')
+  expect(again.startedAt).toBe(50)
+  expect('endedAt' in again).toBe(false)
+  expect('outputTokens' in again).toBe(false)
 })
 
 test('the excerpt drops routing notes and keeps the newest messages', async () => {
@@ -230,9 +328,9 @@ test('context figures are summed, scaled and drawn', async () => {
   expect(percentOf(1, 0)).toBe(0)
   expect(contextBar(40)).toBe('████░░░░░░')
   expect(contextBar(150)).toBe('██████████')
-  expect(contextColor(59)).toBe('green')
-  expect(contextColor(70)).toBe('yellow')
-  expect(contextColor(90)).toBe('red')
+  expect(contextColor(59)).toBe('success')
+  expect(contextColor(70)).toBe('warning')
+  expect(contextColor(90)).toBe('error')
   expect(contextFigures(226_000, 1_000_000)).toBe('23% · 226k / 1M')
   expect(contextFigures(226_000, 1_000_000, 24)).toBe('24% · 226k / 1M')
 })
@@ -287,13 +385,9 @@ test('CLAUDE_CODE_DISABLE_1M_CONTEXT holds every worker at 200k', async () => {
   expect(isSwitchOn(undefined)).toBe(false)
 })
 
-test('only the latest runs are kept, newest first', async () => {
-  expect(pushRun([2, 1], 3, 3)).toEqual([3, 2, 1])
-  expect(pushRun([3, 2, 1], 4, 3)).toEqual([4, 3, 2])
-})
-
 test('the context subcommand is read and the report lists main and agents', async () => {
   expect(readToggleCommand(' Context ')).toEqual({ scope: 'context' })
+  expect(readToggleCommand('panel')).toEqual({ scope: 'panel' })
   expect(readToggleCommand('context now')).toEqual({ scope: 'status', isUnknown: true })
 
   const report = formatContextReport({ label: 'main', tokens: 100_000, window: 200_000 }, [

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, TurnStepInput, TurnUsage } from 'claude-code'
+import type { AgentSpawnInput, AgentSpawnResult, ElementTable, EngineInterface, Register, RenderElement } from 'claude-code'
 
 import {
   ASK_TOOL,
@@ -8,6 +8,8 @@ import {
   MARK_CLOSE,
   MARK_OPEN,
   TIERS,
+  agentLabel,
+  cappedSubagentEffort,
   contextBar,
   contextColor,
   contextFigures,
@@ -15,9 +17,12 @@ import {
   clipMemoryIndex,
   contextWindowOf,
   directoryOf,
+  endStatusOf,
   excerptOf,
   formatAnswers,
   formatContextReport,
+  formatElapsed,
+  formatReports,
   formatTokens,
   guessTier,
   isActiveStatus,
@@ -29,26 +34,35 @@ import {
   isWorthRouting,
   memoryIndexPathOf,
   parseVerdict,
+  patchAgent,
   percentOf,
   pickLastWorker,
-  pushRun,
+  pushReport,
   readAnswers,
   readDefaultToggle,
   readOverride,
   readQuestions,
+  readRouterModel,
   readSavedToggle,
   readToggleCommand,
+  readWorkerEffort,
+  restartAgent,
+  routerChain,
   sessionToggleKey,
   tierOfWorker,
+  upsertAgent,
   workerType,
   type ContextLine,
   type Provider,
+  type Route,
+  type RouterModel,
   type SavedToggle,
   type Tier,
   type WindowEnv,
   type WorkerCandidate,
+  type WorkerEffort,
 } from './route'
-import type { SessionToggle, WorkerRun } from '../types'
+import type { AgentRow, MainContext, SessionToggle } from '../types'
 
 const ASK_TOOL_NAME = `mcp__model-balance__${ASK_TOOL}` as const
 
@@ -59,7 +73,8 @@ declare module 'claude-code' {
   }
 }
 
-type Verdict = { tier: Tier; by: 'override' | 'classifier' | 'heuristic'; isContinuation: boolean }
+/** `by` names who decided: `override`, `<model> router` or `heuristic`. */
+type Verdict = { route: Route; by: string; isContinuation: boolean }
 
 /** The latest top-level worker as the router reads it for a follow-up. */
 type LastWorker = { id: string; tier: Tier; description: string; task: string; isActive: boolean }
@@ -73,42 +88,60 @@ const MAIN_WRITE_TOOLS = ['Edit', 'Write', 'NotebookEdit'] as const
 /** How much of the last worker's task the classifier reads to judge a follow-up. */
 const LAST_TASK_CHARS = 1500
 
-const CLASSIFIER_SYSTEM = `You rate how hard a coding-assistant request is, to pick the cheapest model that will do it well.
-HAIKU: lookups, explanations of a known thing, renames, typos, formatting, small single-file edits, translations, summaries, commit messages.
-SONNET: everyday engineering: features, bug fixes with a clear lead, tests, multi-file edits that follow existing patterns, code review.
-OPUS: architecture and design decisions, unclear root causes, cross-cutting refactors or migrations, concurrency, security, performance, long multi-step plans.
-When unsure between two, pick the higher.
-When a <last_worker> block describes a task a worker is doing or did, also judge whether the request continues that task (a follow-up, a correction, more of the same, an answer to its question) or is a new task, and answer with two words: the level and CONTINUE or NEW, e.g. "SONNET NEW". Without that block answer with exactly one word: HAIKU, SONNET or OPUS.`
+const CLASSIFIER_SYSTEM = `You route one request in a coding-assistant session to the cheapest handler that will do it well.
+MAIN: the main conversation answers it at once from what is already in the conversation, with no file to read or change: a question about the last answer or about work a worker just reported, a clarification, a choice or yes/no the user makes, a commit message or summary of work the conversation already describes.
+HAIKU: small, well-specified work: lookups, explaining a known thing, renames, typos, formatting, small single-file edits, translations.
+SONNET: everyday engineering: features, bug fixes with a clear lead, tests, multi-file edits that follow existing patterns, code review, checking a change in the browser.
+OPUS: architecture and design decisions, unclear root causes, cross-cutting refactors or migrations, matching an old system's behaviour exactly, concurrency, security, performance, long multi-step plans.
+When unsure between two levels, pick the higher. Pick MAIN only when nothing has to be read, run or changed.
+When a <last_worker> block describes a task a worker is doing or did, also judge whether the request continues that task (a follow-up, a correction, more of the same, an answer to its question, "try the second option") or is a new task, and answer with two words: the level and CONTINUE or NEW, e.g. "SONNET NEW". MAIN is always "MAIN NEW". Without that block answer with exactly one word: MAIN, HAIKU, SONNET or OPUS.`
 
 const workerPrompt = (tier: Tier): string => `You are the ${tier} worker of the model-balance router: it judged the task you are given to be of ${tier}-level difficulty.
 
-Your input has up to three parts. <main_conversation_excerpt> quotes the latest messages of the user's main conversation, for context only: earlier decisions, constraints and what was already tried. <auto_memory> is the index of the user's auto memory, which the main conversation loads and you do not: one line per memory file in the directory it names. <task> is the work to do now.
+You do not see the user's main conversation. Your first message brings what you need from it:
+- <handoff> is your task: the main conversation's brief, written by the model that has the whole conversation, with the request, the context that bears on it, pointers and what done means. It is your primary source.
+- <earlier_workers> holds the reports of the workers that ran before you in this session, newest first. Build on what they changed and decided; do not redo or undo their work unless the handoff says so.
+- <recent_messages> quotes the latest messages of the main conversation verbatim, for the user's exact wording. Where it and the handoff disagree, the newest user message wins.
+- <auto_memory> is the index of the user's auto memory, which the main conversation loads and you do not: one line per memory file in the directory it names.
+A later message from the main conversation continues the same task (a follow-up, a correction, answers) and says what changed since your last report.
 
-Before you start, open with Read the memory files whose line touches your task, every feedback_ one among them, and follow them as the main conversation would. Leave writing memory to the main conversation: name anything worth remembering in your report.
+Before you start, open with Read the memory files whose line touches your task, every feedback_ one among them, and follow them as the main conversation would. Leave writing memory to the main conversation.
 
 Do the task completely with the tools you have, following the project's instructions.
 
-When the work needs a decision only the user can make (a choice between approaches, a missing fact, an ambiguity the request, the code and the docs do not settle), ask it with the ${ASK_TOOL_NAME} tool: it opens the user's own AskUserQuestion dialog, waits for the answers and returns them, and you carry on with the task using them. Ask only what blocks the work, gather related questions into one call (up to 4), and never answer in the user's place. Do not end your run with a question in your final message expecting a reply: nobody replies to it. If the tool reports a question left unanswered, stop and list it under "Open questions" in your report. If something else blocks you, stop and say what.
+When the work needs a decision only the user can make (a choice between approaches, a missing fact, an ambiguity the request, the code and the docs do not settle), ask it with the ${ASK_TOOL_NAME} tool: it opens the user's own AskUserQuestion dialog, waits for the answers and returns them, and you carry on with the task using them. Ask only what blocks the work, gather related questions into one call (up to 4), and never answer in the user's place. Do not end your run with a question in your final message expecting a reply: nobody replies to it. If the tool reports a question left unanswered, stop and list it under "Open" in your report. If something else blocks you, stop and say what.
 
-Your final message is the only thing the main conversation receives, so make it a self-contained report: the outcome, the files you changed (paths), key findings or decisions, the questions you asked with the user's answers, and anything left open. Keep it under about 300 words unless the answer itself (code or text the user asked for) needs more. Write it in the language the user writes in.`
+Your final message is the only thing the main conversation receives, and it is kept as the session's record of your work for the workers after you. Write it as a report under these headings, leaving out a heading with nothing under it:
+## Result: the outcome in one to three sentences.
+## Changes: each file you changed, by path, and what changed in it.
+## Decisions & findings: what you decided or learned that later work must know.
+## Questions: each question you asked the user, with the answer.
+## Open: what is left undone or unverified, and any question still open.
+## Remember: anything worth saving to memory.
+Keep it under about 350 words unless the answer itself (code or text the user asked for) needs more. Write it in the language the user writes in.`
 
 const NO_EDITS = 'Edit, Write and NotebookEdit are refused to you on this turn, outside the auto-memory directory.'
 
 const workerFollowUp = `The worker asks the user its own questions through a dialog while it runs. If its report still ends with open questions for the user, do not answer them yourself and do not stop there: ask them with AskUserQuestion, then continue that same worker with SendMessage (its agent id or name; load SendMessage through ToolSearch if it is deferred), passing the answers verbatim, and wait for its new report.
-When the worker returns, answer the user with its report: relay it faithfully and briefly, adding nothing you have not verified.`
+When the worker returns, answer the user from its report: relay its result, its changes and what is left open, faithfully and briefly, adding nothing you have not verified.`
 
 const workerLabel = ({ id, tier, description }: LastWorker): string =>
   `${tier} worker ${id}${description === '' ? '' : ` ("${description}")`}`
 
-const spawnNote = ({ tier, by }: Verdict): string => `${MARK_OPEN}
+const spawnNote = (tier: Tier, by: string): string => `${MARK_OPEN}
 The model-balance router rated this request ${tier.toUpperCase()} difficulty (${by}).
-Do not do the work yourself and do not read files first. ${NO_EDITS} Call the Agent tool once with subagent_type "${workerType(tier)}", a short description, and a prompt that restates the user's request with every detail from this conversation the worker needs; the router attaches the recent conversation to that prompt itself.
+Do not do the work yourself and do not read files first. ${NO_EDITS} Call the Agent tool once with subagent_type "${workerType(tier)}", a short description, and a prompt that briefs a colleague who has not seen this conversation, under these headings:
+## Request: the user's request in full, in their own words where the wording matters.
+## Context: what this conversation has settled that bears on it: decisions, constraints, the user's preferences and corrections, what was tried and failed, earlier results it builds on.
+## Pointers: files, routes, symbols, commands or URLs already known.
+## Done when: what the user will check.
+Write it from the whole conversation, a summary of earlier parts included, and leave out what does not bear on the task. The router adds the earlier workers' reports, the latest messages verbatim and the memory index itself, so do not paste those.
 ${workerFollowUp} Only if the worker failed or the report shows the task is clearly not ${tier}-level may you retry once with another model-balance worker type.
 ${MARK_CLOSE}`
 
-const continueNote = (worker: LastWorker, by: Verdict['by']): string => `${MARK_OPEN}
+const continueNote = (worker: LastWorker, by: string): string => `${MARK_OPEN}
 The model-balance router judged this request a continuation of the task the ${workerLabel(worker)} ${worker.isActive ? 'is doing' : 'did'} (${by}).
-Do not do the work yourself and do not spawn a new worker. ${NO_EDITS} Send the request to that worker with SendMessage (to: "${worker.id}"; load SendMessage through ToolSearch if it is deferred), restating the user's words with every detail from this conversation it needs. ${worker.isActive ? 'It is still running and takes the message as a course correction.' : 'It resumes with its full history and model.'}
+Do not do the work yourself and do not spawn a new worker. ${NO_EDITS} Send the request to that worker with SendMessage (to: "${worker.id}"; load SendMessage through ToolSearch if it is deferred): the user's words, with every detail it needs, and what changed in this conversation since its last report (decisions, answers, other work done). ${worker.isActive ? 'It is still running and takes the message as a course correction.' : 'It resumes with its full history and model.'}
 ${workerFollowUp}
 ${MARK_CLOSE}`
 
@@ -120,16 +153,33 @@ ${MARK_CLOSE}`
 const toggleRef = { plugin: 'model-balance', key: 'toggle' } as const
 
 const mainContextAtom = atom({ plugin: 'model-balance', key: 'mainContext' } as const, null)
-const workerRunsAtom = atom({ plugin: 'model-balance', key: 'workerRuns' } as const, [])
+const agentsAtom = atom({ plugin: 'model-balance', key: 'agents' } as const, [])
+const reportsAtom = atom({ plugin: 'model-balance', key: 'reports' } as const, [])
+const historyOpenAtom = atom({ plugin: 'model-balance', key: 'isHistoryOpen' } as const, false)
+const paneDismissedAtom = atom({ plugin: 'model-balance', key: 'isPaneDismissed' } as const, false)
 
-/** Finished worker runs the band lists, newest first. */
-const BAND_RUNS = 3
+/** The board's pane: the band's rows where no band is drawn (VS Code), or wherever the person opens it. */
+const PANE = 'model-balance'
+
+/** Subagent runs the board keeps, newest first. */
+const BOARD_AGENTS = 12
+
+/** Finished runs listed once the person opens them. */
+const BOARD_FINISHED_SHOWN = 6
+
+/** Worker reports kept for later workers, and how many of them a new worker reads. */
+const REPORTS_KEPT = 8
+const REPORTS_IN_PROMPT = 4
 
 /** Wide enough for `model-balance · main`, so terminal rows line their figures up in one column. */
-const TERMINAL_LABEL_WIDTH = 20
+const TERMINAL_LABEL_WIDTH = 22
 
-/** Agents whose latest context is remembered for `/model-balance context`. */
-const MAX_TRACKED_AGENTS = 50
+const STATUS_MARK: Readonly<Record<AgentRow['status'], { glyph: string; color: string }>> = {
+  running: { glyph: '▶', color: 'claude' },
+  done: { glyph: '✓', color: 'success' },
+  failed: { glyph: '✗', color: 'error' },
+  stopped: { glyph: '■', color: 'warning' },
+}
 
 const statusText = (isOn: boolean): string => (isOn ? 'model-balance: on' : 'model-balance: off')
 
@@ -208,26 +258,43 @@ const pruneSavedToggles = async ($: EngineInterface): Promise<void> => {
 const lastWorkerBlock = (worker: LastWorker): string =>
   `<last_worker status="${worker.isActive ? 'running' : 'finished'}">\nDescription: ${worker.description}\nTask: ${worker.task.slice(0, LAST_TASK_CHARS)}\n</last_worker>\n\n`
 
-/** Without a classifier verdict, a follow-up is never assumed: the heuristic only rates difficulty. */
-const classify = async ($: EngineInterface, text: string, last: LastWorker | undefined): Promise<Verdict> => {
-  try {
-    const recent = excerptOf((await $.session.messages()).slice(-4)).slice(-3000)
-    const reply = await $.model.complete({
-      model: 'haiku',
-      system: CLASSIFIER_SYSTEM,
-      prompt: `${recent === '' ? '' : `Recent conversation:\n${recent}\n\n`}${last === undefined ? '' : lastWorkerBlock(last)}Request to rate:\n${text.slice(0, 6000)}`,
-      maxTokens: 10,
-      timeoutMs: 10_000,
-    })
-    const tier = reply.isAnswered ? parseVerdict(reply.text) : undefined
-    if (tier !== undefined && reply.isAnswered) {
-      return { tier, by: 'classifier', isContinuation: last !== undefined && isContinuationReply(reply.text) }
+/**
+ * Rates the request with the configured router model, the other one standing in when it fails or is
+ * blocked; without either verdict the heuristic rates difficulty alone and never assumes a follow-up.
+ */
+const classify = async (
+  $: EngineInterface,
+  text: string,
+  last: LastWorker | undefined,
+  routerModel: RouterModel,
+): Promise<Verdict> => {
+  const recent = excerptOf((await $.session.messages()).slice(-6)).slice(-4000)
+  const prompt = `${recent === '' ? '' : `Recent conversation:\n${recent}\n\n`}${last === undefined ? '' : lastWorkerBlock(last)}Request to rate:\n${text.slice(0, 6000)}`
+
+  for (const model of routerChain(routerModel)) {
+    try {
+      const reply = await $.model.complete({
+        model,
+        system: CLASSIFIER_SYSTEM,
+        prompt,
+        maxTokens: 16,
+        effort: 'low',
+        timeoutMs: model === routerModel ? 8000 : 5000,
+      })
+      const route = reply.isAnswered ? parseVerdict(reply.text) : undefined
+      if (route !== undefined && reply.isAnswered) {
+        return {
+          route,
+          by: `${model} router`,
+          isContinuation: route !== 'main' && last !== undefined && isContinuationReply(reply.text),
+        }
+      }
+    } catch {
+      // A model the allowlist blocks rejects instead of answering; the next router stands in.
     }
-  } catch {
-    // A model the allowlist blocks rejects instead of answering; the heuristic stands in.
   }
 
-  return { tier: guessTier(text), by: 'heuristic', isContinuation: false }
+  return { route: guessTier(text), by: 'heuristic', isContinuation: false }
 }
 
 /**
@@ -248,7 +315,7 @@ const readMemoryIndex = async ($: EngineInterface): Promise<{ path: string; text
   }
 }
 
-/** `task` is the worker's `<task>` as spawned, '' when this module did not see the spawn (a reload since). */
+/** `task` is the worker's handoff as spawned, '' when this module did not see the spawn (a reload since). */
 const toLastWorker = (agent: WorkerCandidate, task: string | undefined): LastWorker | undefined => {
   const tier = tierOfWorker(agent.type)
 
@@ -276,39 +343,153 @@ async function workerTier(
   return tier
 }
 
-export const register: Register = on => {
-  /** Worker runs this module started, by agent id; lost on a reload, which only drops their finish toast. */
+/**
+ * Puts a started subagent on the board, and a worker in `workers`; a resumed one starts its clock again.
+ * Never fails the spawn.
+ */
+async function trackSpawn(
+  $: EngineInterface,
+  workers: Map<string, Tier>,
+  e: AgentSpawnInput,
+  started: AgentSpawnResult,
+  tier: Tier | undefined,
+): Promise<void> {
+  const agentId = started.agentId
+  if (agentId === undefined || started.deny !== undefined) return
+  if (tier !== undefined) workers.set(agentId, tier)
+  try {
+    const now = await $.clock.now()
+    const window = contextWindowOf(started.model, await readWindowEnv($))
+    await update($, agentsAtom, rows => {
+      const known = rows.find(row => row.id === agentId)
+      const row: AgentRow = {
+        id: agentId,
+        type: e.subagentType,
+        ...(tier === undefined ? {} : { tier }),
+        description: known?.description ?? e.description,
+        status: 'running',
+        startedAt: now,
+        model: started.model,
+        window,
+      }
+
+      return upsertAgent(rows, row, BOARD_AGENTS)
+    })
+  } catch {
+    // The board misses this run; the spawn itself is unaffected.
+  }
+}
+
+/** Opens the board's pane in VS Code, which draws no band, unless the person closed it this session. */
+const openPaneInEditor = async ($: EngineInterface): Promise<void> => {
+  if (await read($, paneDismissedAtom)) return
+  if (!(await $.session.surfaces()).includes('vscode')) return
+  if ((await $.ui.panes()).some(pane => pane.id === PANE)) return
+
+  // Unasked, a pane may wait for room (`isPlaced: false`); `/model-balance panel` opens it at any width.
+  await $.ui.open({ id: PANE, title: 'model-balance' })
+}
+
+type BoardElements = Pick<ElementTable, 'Box' | 'Text' | 'Button'>
+
+/**
+ * The rows the band and the pane share: main's context, every running subagent, and the finished ones
+ * behind one button. On the terminal labels are padded into one column and figures drawn without the bar;
+ * other surfaces keep the bar.
+ */
+const drawBoard = (
+  $: EngineInterface,
+  { Box, Text, Button }: BoardElements,
+  board: { main: MainContext | null; rows: readonly AgentRow[]; isHistoryOpen: boolean; now: number; isTerminal: boolean },
+): RenderElement => {
+  const { main, rows, isHistoryOpen, now, isTerminal } = board
+  const label = (text: string, width: number): string => (isTerminal ? text.slice(0, width).padEnd(width) : text)
+  const figures = (tokens: number, window: number, percent: number): string =>
+    `${isTerminal ? '' : `${contextBar(percent)} `}${contextFigures(tokens, window, percent)}`
+  const mainPercent = main?.percent ?? (main?.tokens === undefined ? undefined : percentOf(main.tokens, main.window))
+  const running = rows.filter(row => row.status === 'running')
+  const finished = rows.filter(row => row.status !== 'running')
+
+  const agentRow = (row: AgentRow): RenderElement => {
+    const mark = STATUS_MARK[row.status]
+    const percent = row.contextTokens === undefined ? undefined : percentOf(row.contextTokens, row.window)
+    const tail = [
+      row.outputTokens === undefined || row.status === 'running' ? '' : ` · out ${formatTokens(row.outputTokens)}`,
+      row.effort === undefined ? '' : ` · effort ${row.effort}`,
+      row.description === '' ? '' : ` · ${row.description}`,
+    ].join('')
+
+    return (
+      <Box key={`agent-${row.id}`}>
+        <Text wrap="truncate-end">
+          <Text color={mark.color}>{mark.glyph} </Text>
+          {/* The glyph and its space take two cells of the column main's label fills. */}
+          <Text weight="semibold">{label(agentLabel(row), TERMINAL_LABEL_WIDTH - 2)}</Text>
+          {` ${formatElapsed((row.endedAt ?? now) - row.startedAt)}`}
+          {percent === undefined || row.contextTokens === undefined ? null : (
+            <Text color={contextColor(percent)}> · ctx {contextFigures(row.contextTokens, row.window, percent)}</Text>
+          )}
+          <Text dimColor>{tail}</Text>
+        </Text>
+      </Box>
+    )
+  }
+
+  return (
+    <Box flexDirection="column">
+      {main === null ? null : (
+        <Box key="main" gap={1}>
+          <Text dimColor>{label('model-balance · main', TERMINAL_LABEL_WIDTH)}</Text>
+          {mainPercent === undefined || main.tokens === undefined ? (
+            <Text dimColor>context —</Text>
+          ) : (
+            <Text color={contextColor(mainPercent)}>{figures(main.tokens, main.window, mainPercent)}</Text>
+          )}
+        </Box>
+      )}
+      {running.map(agentRow)}
+      {finished.length === 0 ? null : (
+        <Box key="history">
+          <Button
+            key="history-toggle"
+            label={isHistoryOpen ? `▾ Hide finished (${finished.length})` : `▸ Finished (${finished.length})`}
+            dimColor
+            // ctrl+x tab then Enter presses it: the band's focus starts here.
+            autoFocus
+            onPress={() => update($, historyOpenAtom, isOpen => !isOpen)}
+          />
+        </Box>
+      )}
+      {isHistoryOpen ? finished.slice(0, BOARD_FINISHED_SHOWN).map(agentRow) : null}
+    </Box>
+  )
+}
+
+export const register: Register = (on, options) => {
+  const routerModel = readRouterModel(options.router_model)
+  const workerEffort = Object.fromEntries(
+    TIERS.map(tier => [tier, readWorkerEffort(options[`${tier}_effort`], tier)]),
+  ) as Record<Tier, WorkerEffort>
+  /** Worker runs this module started, by agent id; lost on a reload, which only costs a lookup in the agent list. */
   const workers = new Map<string, Tier>()
-  /**
-   * The effort of the main loop's latest request, which workers are sent with.
-   * Empty after a reload until main sends its next request; workers keep their default meanwhile.
-   */
-  let mainEffort: TurnStepInput['effort']
-  /**
-   * Usage of every agent's latest request by agent id, oldest write first; its input side is that agent's
-   * context at that moment. Kept after the agent finishes so `/model-balance context` can still list it.
-   */
-  const lastStepUsage = new Map<string, TurnUsage>()
-  /**
-   * The model each worker was started on, as core resolved it. Preferred over the API's reported id, which
-   * drops a `[1m]` suffix the worker inherited from main. Lost on a reload; the reported id stands in then.
-   */
-  const spawnedModels = new Map<string, string>()
   /** The latest top-level worker this module started; lost on a reload, when the agent list's last one stands in. */
   let lastWorkerId: string | undefined
   /**
-   * Each worker's task as main wrote it, by agent id, for the classifier to judge a follow-up against;
+   * Each worker's handoff as main wrote it, by agent id, for the classifier to judge a follow-up against;
    * the agent list carries only a short description. Lost on a reload: the description alone stands in.
    */
   const workerTasks = new Map<string, string>()
 
   on('session.start', async ($, e, next) => {
     for (const tier of TIERS) {
+      const effort = workerEffort[tier]
       await $.agent.register({
         name: `${tier}-worker`,
         description: `Worker for ${tier}-level tasks. Use only when a model-balance routing note names this type.`,
         prompt: workerPrompt(tier),
         model: tier,
+        // docs/sub-agents: frontmatter `effort` overrides the session's level; `session` leaves it to Claude Code.
+        ...(effort === 'session' ? {} : { effort }),
         disallowedTools: ['Agent'],
       })
     }
@@ -322,7 +503,8 @@ export const register: Register = on => {
     await $.command.register({
       name: 'model-balance',
       description: 'Route prompts to Haiku/Sonnet/Opus workers by difficulty',
-      argumentHint: '[on|off|status|context|default on|off]',
+      argumentHint: '[on|off|status|context|panel|default on|off]',
+      immediate: true,
     })
     $.ui.status(statusText(await isEnabled($)))
     try {
@@ -336,6 +518,14 @@ export const register: Register = on => {
     } catch {
       // Housekeeping only: a failed prune leaves old entries for the next start.
     }
+    // A running row's clock: redraw each second while one runs, nothing otherwise.
+    $.clock.every(1000, () => {
+      void read($, agentsAtom)
+        .then(rows => {
+          if (rows.some(row => row.status === 'running')) $.ui.invalidate('ui.render')
+        })
+        .catch(() => undefined)
+    })
 
     return next(e)
   })
@@ -358,6 +548,18 @@ export const register: Register = on => {
         text: `New sessions now start with model-balance ${onOff(command.enabled)}. This session stays ${onOff(await isEnabled($))}.`,
       }
     }
+    if (command.scope === 'panel') {
+      if ((await $.ui.panes()).some(pane => pane.id === PANE)) {
+        await update($, paneDismissedAtom, () => true)
+        await $.ui.close({ id: PANE })
+
+        return { text: 'model-balance panel closed; /model-balance panel opens it again.' }
+      }
+      await update($, paneDismissedAtom, () => false)
+      const opened = await $.ui.open({ id: PANE, title: 'model-balance' })
+
+      return { text: opened.isPlaced ? 'model-balance panel opened.' : `model-balance panel is waiting: ${opened.reason}` }
+    }
 
     if (command.scope === 'context') {
       const { context } = await $.session.usage()
@@ -367,14 +569,14 @@ export const register: Register = on => {
         window: context.window,
       }
       const windowEnv = await readWindowEnv($)
+      const rows = await read($, agentsAtom)
       const agents: ContextLine[] = (await $.agent.list()).map(agent => {
-        const usage = lastStepUsage.get(agent.id)
-        const model = spawnedModels.get(agent.id) ?? usage?.model ?? agent.type
+        const row = rows.find(one => one.id === agent.id)
 
         return {
           label: `${agent.type}${agent.description === '' ? '' : ` · ${agent.description}`}`,
-          tokens: usage === undefined ? undefined : contextTokensOf(usage),
-          window: contextWindowOf(model, windowEnv),
+          ...(row?.contextTokens === undefined ? {} : { tokens: row.contextTokens }),
+          window: row?.window ?? contextWindowOf(agent.type, windowEnv),
           note: agent.status,
         }
       })
@@ -383,10 +585,11 @@ export const register: Register = on => {
     }
 
     const main = await $.session.model()
-    const usage = 'Use /model-balance on|off for this session, /model-balance default on|off for new sessions, /model-balance context for every context window.'
+    const efforts = TIERS.map(tier => `${tier} ${workerEffort[tier]}`).join(' · ')
+    const usage = 'Use /model-balance on|off for this session, /model-balance default on|off for new sessions, /model-balance context for every context window, /model-balance panel to open or close the board.'
 
     return {
-      text: `${command.isUnknown ? `Unknown argument "${e.args.trim()}". ` : ''}model-balance is ${onOff(await isEnabled($))} for this session (new sessions start ${onOff(await readDefault($))}). Main model: ${main}. ${usage} Prefix a prompt with #haiku, #sonnet or #opus to force a worker, or #main to skip routing.`,
+      text: `${command.isUnknown ? `Unknown argument "${e.args.trim()}". ` : ''}model-balance is ${onOff(await isEnabled($))} for this session (new sessions start ${onOff(await readDefault($))}). Main model: ${main}. Router: ${routerModel}. Worker effort: ${efforts} (never above xhigh). ${usage} Prefix a prompt with #haiku, #sonnet or #opus to force a worker, or #main to skip routing.`,
     }
   })
 
@@ -409,7 +612,17 @@ export const register: Register = on => {
     const running = runningAgent === undefined ? undefined : toLastWorker(runningAgent, workerTasks.get(runningAgent.id))
     // An explicit #tier asks for a fresh worker, so only the classifier's own verdict continues one.
     const verdict: Verdict =
-      override === undefined ? await classify($, text, last) : { tier: override, by: 'override', isContinuation: false }
+      override === undefined
+        ? await classify($, text, last, routerModel)
+        : { route: override, by: 'override', isContinuation: false }
+
+    // Answerable from the conversation itself: main answers, with no note and no worker.
+    if (verdict.route === 'main') {
+      $.ui.status(`model-balance → main (${verdict.by})`)
+
+      return next({ ...e, text })
+    }
+    const tier = verdict.route
 
     const note = (() => {
       if (verdict.isContinuation && last !== undefined && (running === undefined || running.id === last.id)) {
@@ -420,22 +633,32 @@ export const register: Register = on => {
         $.ui.status(`model-balance → on hold: ${running.tier} worker still running`)
         return waitNote(running)
       }
-      $.ui.status(`model-balance → ${verdict.tier} (${verdict.by})`)
-      return spawnNote(verdict)
+      $.ui.status(`model-balance → ${tier} (${verdict.by})`)
+      return spawnNote(tier, verdict.by)
     })()
 
     return next({ ...e, text, context: [...(e.context ?? []), note] })
   }).catch(($, e, next) => {
-    // The router failing must never cost the person their prompt: it goes to main as typed.
-    if (next.error.kind !== 're-entry') $.ui.status('model-balance → main (router failed)')
+    // The router failing must never cost the person their prompt: it goes to main as typed. This build types
+    // `kind` without `re-entry`, which the docs still list for a skipped re-entrant dispatch.
+    if ((next.error.kind as string) !== 're-entry') $.ui.status('model-balance → main (router failed)')
 
     return next(e)
   })
 
-  /** One top-level worker writes at a time: a second spawn while one runs is refused, whoever asks for it. */
+  /**
+   * One top-level worker writes at a time: a second spawn while one runs is refused, whoever asks for it.
+   * A worker starts from main's handoff with the session's record beside it; every other subagent passes
+   * untouched and only goes on the board.
+   */
   on('agent.spawn', async ($, e, next) => {
     const tier = tierOfWorker(e.subagentType)
-    if (tier === undefined || e.fork || e.parentAgentId !== undefined) return next(e)
+    if (tier === undefined || e.fork || e.parentAgentId !== undefined || e.resume !== undefined) {
+      const started = await next(e)
+      await trackSpawn($, workers, e, started, tier)
+
+      return started
+    }
 
     const running = (await $.agent.list()).find(agent => isTopLevelWorker(agent) && isActiveStatus(agent.status))
     if (running !== undefined) {
@@ -444,26 +667,34 @@ export const register: Register = on => {
       }
     }
 
+    const earlier = formatReports(await read($, reportsAtom), REPORTS_IN_PROMPT)
     const excerpt = excerptOf(await $.session.messages())
     const memory = await readMemoryIndex($)
+    // Long material first and the task last, as docs/long-context-tips lays out a prompt.
     const prompt = [
-      excerpt === '' ? '' : `<main_conversation_excerpt>\n${excerpt}\n</main_conversation_excerpt>`,
       memory === undefined ? '' : `<auto_memory dir="${directoryOf(memory.path)}">\n${memory.text}\n</auto_memory>`,
-      `<task>\n${e.prompt}\n</task>`,
+      excerpt === '' ? '' : `<recent_messages>\n${excerpt}\n</recent_messages>`,
+      earlier === '' ? '' : `<earlier_workers>\n${earlier}\n</earlier_workers>`,
+      `<handoff>\n${e.prompt}\n</handoff>`,
     ]
       .filter(part => part !== '')
       .join('\n\n')
     const started = await next({ ...e, prompt, model: tier })
-    if (started.agentId !== undefined) {
-      workers.set(started.agentId, tier)
+    if (started.agentId !== undefined && started.deny === undefined) {
       lastWorkerId = started.agentId
-      rememberLatest(workerTasks, started.agentId, e.prompt, MAX_TRACKED_AGENTS)
-      if (started.deny === undefined) rememberLatest(spawnedModels, started.agentId, started.model, MAX_TRACKED_AGENTS)
+      rememberLatest(workerTasks, started.agentId, e.prompt, BOARD_AGENTS)
+      await trackSpawn($, workers, e, started, tier)
+      $.ui.status(`model-balance ▶ ${tier} worker: ${e.description}`)
+      try {
+        await openPaneInEditor($)
+      } catch {
+        // The board stays one /model-balance panel away.
+      }
     }
 
     return started
   }).catch(($, e, next) => {
-    // Preparing the worker failed: it still starts, on its tier's model, without the excerpt and memory index.
+    // Preparing the worker failed: it still starts, on its tier's model, without the session's record.
     const tier = tierOfWorker(e.subagentType)
 
     return next.called || tier === undefined ? next(e) : next({ ...e, model: tier })
@@ -522,45 +753,129 @@ export const register: Register = on => {
       result: `${formatAnswers(asked, [])}\n\nThe user wrote, in place of choosing an option: "${written}". Read it as their answer to every question above left without a choice${unanswered.length === 0 ? '' : ` (${unanswered.map(q => `"${q}"`).join(', ')})`}.`.trimStart(),
     }
   }).catch(() => ({
-    deny: 'The question dialog could not be opened. Do not guess: stop, and list your questions under "Open questions" in your final report.',
+    deny: 'The question dialog could not be opened. Do not guess: stop, and list your questions under "Open" in your final report.',
   }))
 
-  on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined) {
-      mainEffort = e.effort
+  /** A run of a subagent begins: a resume through SendMessage, which raises no spawn, starts its clock again. */
+  on('turn.start', async ($, e, next) => {
+    const agentId = e.agentId
+    if (agentId !== undefined) {
+      try {
+        const now = await $.clock.now()
+        const rows = await read($, agentsAtom)
+        const known = rows.find(row => row.id === agentId)
+        const agent = known === undefined ? (await $.agent.list()).find(one => one.id === agentId) : undefined
+        const windowEnv = known === undefined ? await readWindowEnv($) : undefined
+        await update($, agentsAtom, list => {
+          if (list.some(one => one.id === agentId)) return restartAgent(list, agentId, now)
+          if (agent === undefined || windowEnv === undefined) return list
+          const tier = tierOfWorker(agent.type)
 
-      return yield* next(e)
+          return upsertAgent(
+            list,
+            {
+              id: agentId,
+              type: agent.type,
+              ...(tier === undefined ? {} : { tier }),
+              description: agent.description,
+              status: 'running',
+              startedAt: now,
+              window: contextWindowOf(tier ?? agent.type, windowEnv),
+            },
+            BOARD_AGENTS,
+          )
+        })
+      } catch {
+        // The board shows this run late, at its first request, or not at all; the run is unaffected.
+      }
     }
 
-    const isWorker = mainEffort !== undefined && (await workerTier($, workers, e.agentId)) !== undefined
-    const step = yield* next(isWorker ? { ...e, effort: mainEffort } : e)
-    if (step.usage !== null) rememberLatest(lastStepUsage, e.agentId, step.usage, MAX_TRACKED_AGENTS)
+    return next(e)
+  })
+
+  /**
+   * Every subagent request is held below `max`, the person's ceiling for subagents, and its usage puts the
+   * agent's context fill and effort on the board.
+   */
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined) return yield* next(e)
+
+    const capped = cappedSubagentEffort(e.effort)
+    const effort = capped ?? e.effort
+    const step = yield* next(capped === undefined ? e : { ...e, effort: capped })
+    const agentId = e.agentId
+    const usage = step.usage
+    if (usage !== null) {
+      try {
+        const row = (await read($, agentsAtom)).find(one => one.id === agentId)
+        if (row !== undefined) {
+          const model = row.model ?? usage.model
+          const window = row.model === undefined ? contextWindowOf(model, await readWindowEnv($)) : row.window
+          await update($, agentsAtom, rows =>
+            patchAgent(rows, agentId, {
+              contextTokens: contextTokensOf(usage),
+              model,
+              window,
+              ...(effort === undefined ? {} : { effort: String(effort) }),
+            }),
+          )
+        }
+      } catch {
+        // The board keeps the previous figures; the step itself is done.
+      }
+    }
 
     return step
   })
 
+  /** A subagent's run ended: its row closes, and a worker's report joins the session's record. */
   on('turn.complete', async ($, e, next) => {
-    const tier = e.agentId === undefined ? undefined : await workerTier($, workers, e.agentId)
-    if (tier !== undefined && e.agentId !== undefined) {
-      workers.delete(e.agentId)
-      const last = lastStepUsage.get(e.agentId)
+    const agentId = e.agentId
+    if (agentId !== undefined) {
+      try {
+        const tier = await workerTier($, workers, agentId)
+        const now = await $.clock.now()
+        const status = endStatusOf(e.reason)
+        const row = (await read($, agentsAtom)).find(one => one.id === agentId)
+        await update($, agentsAtom, rows =>
+          patchAgent(rows, agentId, {
+            status,
+            endedAt: now,
+            ...(e.usage === undefined ? {} : { outputTokens: e.usage.output_tokens }),
+          }),
+        )
 
-      const window = contextWindowOf(spawnedModels.get(e.agentId) ?? last?.model ?? e.usage?.model ?? tier, await readWindowEnv($))
-      const run: WorkerRun = {
-        tier,
-        seconds: Math.round(e.durationMs / 1000),
-        window,
-        ...(last === undefined ? {} : { contextTokens: contextTokensOf(last) }),
-        ...(e.usage === undefined ? {} : { outputTokens: e.usage.output_tokens }),
+        if (tier !== undefined) {
+          workers.delete(agentId)
+          const answer = e.answer.trim()
+          if (answer !== '') {
+            await update($, reportsAtom, reports =>
+              pushReport(
+                reports,
+                {
+                  id: agentId,
+                  tier,
+                  description: row?.description ?? '',
+                  report: status === 'done' ? answer : `[${status} before finishing]\n${answer}`,
+                  at: now,
+                },
+                REPORTS_KEPT,
+              ),
+            )
+          }
+
+          const seconds = formatElapsed(row === undefined ? e.durationMs : now - row.startedAt)
+          const context =
+            row?.contextTokens === undefined
+              ? ''
+              : ` · context ${formatTokens(row.contextTokens)} (${percentOf(row.contextTokens, row.window)}%)`
+          const output = e.usage === undefined ? '' : ` · out ${formatTokens(e.usage.output_tokens)}`
+          $.ui.toast(`model-balance: ${tier} worker ${status === 'done' ? 'finished' : status} in ${seconds}${context}${output}`)
+          $.ui.status(statusText(await isEnabled($)))
+        }
+      } catch {
+        // The board and the record miss this end; the turn's own result goes on unchanged.
       }
-      await update($, workerRunsAtom, runs => pushRun(runs, run, BAND_RUNS))
-
-      const context =
-        run.contextTokens === undefined
-          ? ''
-          : ` · context ${formatTokens(run.contextTokens)} (${percentOf(run.contextTokens, window)}%)`
-      const output = run.outputTokens === undefined ? '' : ` · out ${formatTokens(run.outputTokens)}`
-      $.ui.toast(`model-balance: ${tier} worker finished in ${run.seconds}s${context}${output}`)
     }
 
     return next(e)
@@ -579,52 +894,50 @@ export const register: Register = on => {
     return next(e)
   })
 
+  /** A pane the person closed stays closed for the session: the board goes back to the band and the status line. */
+  on('ui.close', async ($, e, next) => {
+    if (e.id === PANE && e.origin.kind === 'person') await update($, paneDismissedAtom, () => true)
+
+    return next(e)
+  }).catch(($, e, next) =>
+    // Remembering the close is a nicety: the close itself always goes through.
+    next(e),
+  )
+
+  /** The band is drawn on the terminal and the desktop only; VS Code gets the same rows in the pane. */
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const toggle = await read($, toggleRef)
     if (e.props.hasSurvey || toggle?.enabled !== true) return next(e)
 
     const main = await read($, mainContextAtom)
-    const runs = await read($, workerRunsAtom)
-    if (main === null && runs.length === 0) return next(e)
+    const rows = await read($, agentsAtom)
+    if (main === null && rows.length === 0) return next(e)
 
-    const { Box, Text } = $.ui.resolve(e)
-    const mainPercent = main?.percent ?? (main?.tokens === undefined ? undefined : percentOf(main.tokens, main.window))
-    // The terminal gets the figures alone, labels in one column; other surfaces keep the bar.
-    const isTerminal = e.surface === 'terminal'
-    const figures = (tokens: number, window: number, percent: number): string =>
-      `${isTerminal ? '' : `${contextBar(percent)} `}${contextFigures(tokens, window, percent)}`
-    const label = (text: string, width: number): string => (isTerminal ? text.padEnd(TERMINAL_LABEL_WIDTH) : text.padEnd(width))
+    return drawBoard($, $.ui.resolve(e), {
+      main,
+      rows,
+      isHistoryOpen: await read($, historyOpenAtom),
+      now: await $.clock.now(),
+      isTerminal: e.surface === 'terminal',
+    })
+  })
 
-    return (
-      <Box flexDirection="column">
-        {main === null ? null : (
-          <Box key="main" gap={1}>
-            <Text dimColor>{label('model-balance · main', 0)}</Text>
-            {mainPercent === undefined || main.tokens === undefined ? (
-              <Text dimColor>context —</Text>
-            ) : (
-              <Text color={contextColor(mainPercent)}>{figures(main.tokens, main.window, mainPercent)}</Text>
-            )}
-          </Box>
-        )}
-        {runs.map((run, index) => {
-          const percent = run.contextTokens === undefined ? undefined : percentOf(run.contextTokens, run.window)
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const main = await read($, mainContextAtom)
+    const rows = await read($, agentsAtom)
+    const els = $.ui.resolve(e)
+    if (main === null && rows.length === 0) {
+      const { Text } = els
 
-          return (
-            <Box key={`run-${index}`} gap={1}>
-              <Text dimColor>{label(`  ${run.tier} worker`, 16)}</Text>
-              {percent === undefined || run.contextTokens === undefined ? (
-                <Text dimColor>context —</Text>
-              ) : (
-                <Text color={contextColor(percent)}>{figures(run.contextTokens, run.window, percent)}</Text>
-              )}
-              <Text dimColor>
-                · {run.seconds}s{run.outputTokens === undefined ? '' : ` · out ${formatTokens(run.outputTokens)}`}
-              </Text>
-            </Box>
-          )
-        })}
-      </Box>
-    )
+      return <Text dimColor>No subagent has run in this session yet.</Text>
+    }
+
+    return drawBoard($, els, {
+      main,
+      rows,
+      isHistoryOpen: await read($, historyOpenAtom),
+      now: await $.clock.now(),
+      isTerminal: e.surface === 'terminal',
+    })
   })
 }

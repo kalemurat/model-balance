@@ -1,6 +1,11 @@
-import type { SessionMessage } from 'claude-code'
+import type { ModelEffort, SessionMessage } from 'claude-code'
+
+import type { AgentRow, WorkerReport } from '../types'
 
 export type Tier = 'haiku' | 'sonnet' | 'opus'
+
+/** Where the router sends a request: a worker tier, or the main conversation itself. */
+export type Route = Tier | 'main'
 
 export const TIERS: readonly Tier[] = ['haiku', 'sonnet', 'opus']
 
@@ -10,9 +15,10 @@ export const MARK_CLOSE = '[/model-balance]'
 /** Shorter prompts are follow-ups ("devam", "ok", "evet") the main model answers itself. */
 const MIN_ROUTED_LENGTH = 16
 
-const EXCERPT_MESSAGES = 20
+/** The verbatim tail a worker gets beside main's handoff brief, for exact wording only. */
+const EXCERPT_MESSAGES = 12
 const EXCERPT_MESSAGE_CHARS = 1500
-const EXCERPT_TOTAL_CHARS = 24000
+const EXCERPT_TOTAL_CHARS = 14000
 
 /** The tool a worker asks the person through; listed as `mcp__model-balance__ask_user`. */
 export const ASK_TOOL = 'ask_user'
@@ -192,13 +198,18 @@ export type ToggleCommand =
   | { scope: 'session'; enabled: boolean }
   | { scope: 'default'; enabled: boolean }
   | { scope: 'context' }
+  | { scope: 'panel' }
   | { scope: 'status'; isUnknown: boolean }
 
-/** Reads `/model-balance` arguments: `on|off` for this session, `default on|off` for new sessions, `context` for every context window, anything else shows the status. */
+/**
+ * Reads `/model-balance` arguments: `on|off` for this session, `default on|off` for new sessions, `context` for
+ * every context window, `panel` to open or close the board's pane, anything else shows the status.
+ */
 export const readToggleCommand = (args: string): ToggleCommand => {
   const words = args.trim().toLowerCase().split(/\s+/).filter(word => word !== '')
   const [first, second] = words
   if (words.length === 1 && first === 'context') return { scope: 'context' }
+  if (words.length === 1 && first === 'panel') return { scope: 'panel' }
   const isSwitch = (word: string | undefined): word is 'on' | 'off' => word === 'on' || word === 'off'
 
   if (words.length === 1 && isSwitch(first)) return { scope: 'session', enabled: first === 'on' }
@@ -210,12 +221,47 @@ export const readToggleCommand = (args: string): ToggleCommand => {
 export const isWorthRouting = (text: string): boolean =>
   text.trim().length >= MIN_ROUTED_LENGTH && !text.trimStart().startsWith('/')
 
-/** Takes the first HAIKU / SONNET / OPUS word of the classifier's reply. */
-export const parseVerdict = (reply: string): Tier | undefined => {
-  const found = /\b(haiku|sonnet|opus)\b/i.exec(reply)
+/** Takes the first MAIN / HAIKU / SONNET / OPUS word of the classifier's reply. */
+export const parseVerdict = (reply: string): Route | undefined => {
+  const found = /\b(main|haiku|sonnet|opus)\b/i.exec(reply)
 
-  return found === null ? undefined : (found[1]!.toLowerCase() as Tier)
+  return found === null ? undefined : (found[1]!.toLowerCase() as Route)
 }
+
+/** The models the router may rate with, a `router_model` option. */
+export type RouterModel = 'sonnet' | 'haiku'
+
+/** `router_model` as configured, Sonnet for anything else: a wrong tier costs a whole worker run, the rating one short request. */
+export const readRouterModel = (value: unknown): RouterModel => (value === 'haiku' ? 'haiku' : 'sonnet')
+
+/** The configured router first, then the other, which stands in when the first fails or is blocked. */
+export const routerChain = (first: RouterModel): readonly RouterModel[] =>
+  first === 'sonnet' ? ['sonnet', 'haiku'] : ['haiku', 'sonnet']
+
+/** The levels a subagent may run at: the person ruled `max` out for every subagent. */
+export type SubagentEffort = Exclude<ModelEffort, 'max'>
+
+/** A worker tier's effort: a level its agent definition carries, or `session` to set none and let Claude Code resolve it. */
+export type WorkerEffort = SubagentEffort | 'session'
+
+const SUBAGENT_EFFORT_LEVELS: readonly SubagentEffort[] = ['low', 'medium', 'high', 'xhigh']
+
+/** Each tier's effort when its `<tier>_effort` option is unset; mirrors the manifest's defaults. */
+export const DEFAULT_WORKER_EFFORT: Readonly<Record<Tier, WorkerEffort>> = { haiku: 'medium', sonnet: 'high', opus: 'xhigh' }
+
+/** A `<tier>_effort` option as configured; an unset or unknown value (`max` included) falls back to the tier's default. */
+export const readWorkerEffort = (value: unknown, tier: Tier): WorkerEffort =>
+  value === 'session' || SUBAGENT_EFFORT_LEVELS.includes(value as SubagentEffort)
+    ? (value as WorkerEffort)
+    : DEFAULT_WORKER_EFFORT[tier]
+
+/**
+ * A subagent request's effort held below `max`, the ceiling the person set: whatever asked for `max` (the
+ * session's level a `session` worker takes, `CLAUDE_CODE_EFFORT_LEVEL`, an Agent call's `effort`) runs at `xhigh`.
+ * `undefined` when the request needs no change.
+ */
+export const cappedSubagentEffort = (effort: ModelEffort | number | undefined): SubagentEffort | undefined =>
+  effort === 'max' ? 'xhigh' : undefined
 
 /** Whether the classifier judged the request a continuation of the last worker's task. */
 export const isContinuationReply = (reply: string): boolean => /\bCONTINUE\b/i.test(reply)
@@ -314,6 +360,9 @@ const escape = (text: string): string =>
 const clip = (text: string, max: number): string =>
   text.length <= max ? text : `${text.slice(0, max)} …[${text.length - max} chars cut]`
 
+/** Main's own messages are cut shorter: they mostly relay worker reports, which reach a worker in a block of their own. */
+const EXCERPT_ASSISTANT_CHARS = 700
+
 /**
  * The main conversation's latest messages as plain text, newest last, sized so
  * the worker gets the thread without the whole transcript being re-sent.
@@ -330,7 +379,7 @@ export const excerptOf = (messages: readonly SessionMessage[]): string => {
     if (text === '' && tools === '') continue
 
     const line = [
-      `${message.role.toUpperCase()}: ${clip(text, EXCERPT_MESSAGE_CHARS)}`,
+      `${message.role.toUpperCase()}: ${clip(text, message.role === 'assistant' ? EXCERPT_ASSISTANT_CHARS : EXCERPT_MESSAGE_CHARS)}`,
       tools === '' ? '' : `  (tools used: ${tools})`,
     ]
       .filter(part => part !== '')
@@ -461,12 +510,61 @@ export const contextBar = (percent: number, width = 10): string => {
 export const contextFigures = (tokens: number, window: number, percent = percentOf(tokens, window)): string =>
   `${percent}% · ${formatTokens(tokens)} / ${formatTokens(window)}`
 
-/** Colour of a context figure: calm until 60%, a warning to 85%, then alarming. */
-export const contextColor = (percent: number): 'green' | 'yellow' | 'red' =>
-  percent < 60 ? 'green' : percent < 85 ? 'yellow' : 'red'
+/** Colour of a context figure, as theme keys so it follows the person's theme: calm until 60%, a warning to 85%, then alarming. */
+export const contextColor = (percent: number): 'success' | 'warning' | 'error' =>
+  percent < 60 ? 'success' : percent < 85 ? 'warning' : 'error'
 
-/** The latest `max` worker runs, newest first. */
-export const pushRun = <T>(runs: readonly T[], run: T, max: number): T[] => [run, ...runs].slice(0, max)
+/** `45s`, `1m 12s`, `1h 3m`: a run's length as the board shows it. */
+export const formatElapsed = (ms: number): string => {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+/** Sets `row` as the newest entry, dropping its earlier copy and the oldest past `max`. */
+export const upsertAgent = (rows: readonly AgentRow[], row: AgentRow, max: number): AgentRow[] =>
+  [row, ...rows.filter(one => one.id !== row.id)].slice(0, max)
+
+/** Applies `change` to the row with `id` in place; the list is returned unchanged when no row has it. */
+export const patchAgent = (rows: readonly AgentRow[], id: string, change: Partial<AgentRow>): AgentRow[] =>
+  rows.map(row => (row.id === id ? { ...row, ...change } : row))
+
+/** Marks the row with `id` running from `now` again, its last run's end and output dropped. */
+export const restartAgent = (rows: readonly AgentRow[], id: string, now: number): AgentRow[] =>
+  rows.map(row => {
+    if (row.id !== id) return row
+    const { endedAt: _endedAt, outputTokens: _outputTokens, ...rest } = row
+
+    return { ...rest, status: 'running', startedAt: now }
+  })
+
+/** How an ended run is shown, by why its turn ended (`turn.complete`'s `reason`). */
+export const endStatusOf = (reason: string): AgentRow['status'] =>
+  reason === 'answer' ? 'done' : reason === 'aborted' ? 'stopped' : 'failed'
+
+/** The board's name for a row: `sonnet worker`, or the agent type for any other subagent. */
+export const agentLabel = (row: Pick<AgentRow, 'tier' | 'type'>): string =>
+  row.tier === undefined ? row.type.replace(/^model-balance:/, '') : `${row.tier} worker`
+
+/** Characters of one report a later worker reads. */
+const REPORT_CHARS = 2500
+
+/** Sets a worker's latest report as the newest entry: a resumed worker's new report replaces its old one. */
+export const pushReport = (reports: readonly WorkerReport[], report: WorkerReport, max: number): WorkerReport[] =>
+  [{ ...report, report: clip(report.report.trim(), REPORT_CHARS) }, ...reports.filter(one => one.id !== report.id)].slice(0, max)
+
+/**
+ * The reports of the workers before the one being started, newest first, as its `<earlier_workers>` block;
+ * '' when there are none.
+ */
+export const formatReports = (reports: readonly WorkerReport[], max: number): string =>
+  reports
+    .slice(0, max)
+    .map(({ id, tier, description, report }) => `<report worker="${tier}" id="${id}" task="${description.replace(/"/g, "'")}">\n${report}\n</report>`)
+    .join('\n\n')
 
 /** One context window in the `/model-balance context` report; `tokens` is absent before its first response. */
 export type ContextLine = { label: string; tokens?: number; window: number; note?: string }

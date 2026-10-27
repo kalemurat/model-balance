@@ -5,11 +5,15 @@ import {
   ASK_TOOL,
   ASK_TOOL_SCHEMA,
   DEFAULT_TOGGLE_KEY,
+  HANDOFF_CONTINUE,
+  HANDOFF_RATIO,
   MARK_CLOSE,
   MARK_OPEN,
   TIERS,
   agentLabel,
-  cappedSubagentEffort,
+  canHandOffSpawn,
+  continuationNote,
+  continuesLine,
   contextBar,
   contextColor,
   contextFigures,
@@ -19,15 +23,21 @@ import {
   directoryOf,
   endStatusOf,
   excerptOf,
+  findContinuation,
   formatAnswers,
   formatContextReport,
   formatElapsed,
   formatReports,
   formatTokens,
   guessTier,
+  handoffBlock,
+  handoffLabel,
+  handoffRequest,
+  handoffsNamedIn,
   isActiveStatus,
   isContinuationReply,
   isInside,
+  isPastHandoffPoint,
   isRoutedTurn,
   isStaleSessionToggle,
   isSwitchOn,
@@ -35,11 +45,15 @@ import {
   memoryIndexPathOf,
   parseVerdict,
   patchAgent,
+  patchHandoff,
   percentOf,
   pickLastWorker,
+  pinnedEffortOf,
+  pushHandoff,
   pushReport,
   readAnswers,
   readDefaultToggle,
+  readHandoffOutcome,
   readOverride,
   readQuestions,
   readRouterModel,
@@ -49,6 +63,7 @@ import {
   restartAgent,
   routerChain,
   sessionToggleKey,
+  subagentEffortOf,
   tierOfWorker,
   upsertAgent,
   workerType,
@@ -62,7 +77,7 @@ import {
   type WorkerCandidate,
   type WorkerEffort,
 } from './route'
-import type { AgentRow, MainContext, SessionToggle } from '../types'
+import type { AgentRow, Handoff, MainContext, SessionToggle } from '../types'
 
 const ASK_TOOL_NAME = `mcp__model-balance__${ASK_TOOL}` as const
 
@@ -103,7 +118,9 @@ You do not see the user's main conversation. Your first message brings what you 
 - <earlier_workers> holds the reports of the workers that ran before you in this session, newest first. Build on what they changed and decided; do not redo or undo their work unless the handoff says so.
 - <recent_messages> quotes the latest messages of the main conversation verbatim, for the user's exact wording. Where it and the handoff disagree, the newest user message wins.
 - <auto_memory> is the index of the user's auto memory, which the main conversation loads and you do not: one line per memory file in the directory it names.
+- <previous_agent_handoff>, when present, is the handoff report of an agent whose context filled before it finished this same task. You continue its work: start where it stopped, not over.
 A later message from the main conversation continues the same task (a follow-up, a correction, answers) and says what changed since your last report.
+A message that opens with "${MARK_OPEN} Context handoff" comes from the router when your context window fills past ${Math.round(HANDOFF_RATIO * 100)}%. It overrides the report format below: follow it as soon as it arrives.
 
 Before you start, open with Read the memory files whose line touches your task, every feedback_ one among them, and follow them as the main conversation would. Leave writing memory to the main conversation.
 
@@ -123,7 +140,8 @@ Keep it under about 350 words unless the answer itself (code or text the user as
 const NO_EDITS = 'Edit, Write and NotebookEdit are refused to you on this turn, outside the auto-memory directory.'
 
 const workerFollowUp = `The worker asks the user its own questions through a dialog while it runs. If its report still ends with open questions for the user, do not answer them yourself and do not stop there: ask them with AskUserQuestion, then continue that same worker with SendMessage (its agent id or name; load SendMessage through ToolSearch if it is deferred), passing the answers verbatim, and wait for its new report.
-When the worker returns, answer the user from its report: relay its result, its changes and what is left open, faithfully and briefly, adding nothing you have not verified.`
+When the worker returns, answer the user from its report: relay its result, its changes and what is left open, faithfully and briefly, adding nothing you have not verified.
+A report that ends with ${HANDOFF_CONTINUE} is a handoff, not a result: its agent stopped because its context filled, and the task goes on. Follow the routing note that comes with it; without one, call the Agent tool at once with the same subagent_type and a prompt that restates your brief and holds the line "${continuesLine('<its agent id>')}", and pass no model or effort: the router attaches the report and keeps the model and effort.`
 
 const workerLabel = ({ id, tier, description }: LastWorker): string =>
   `${tier} worker ${id}${description === '' ? '' : ` ("${description}")`}`
@@ -155,6 +173,7 @@ const toggleRef = { plugin: 'model-balance', key: 'toggle' } as const
 const mainContextAtom = atom({ plugin: 'model-balance', key: 'mainContext' } as const, null)
 const agentsAtom = atom({ plugin: 'model-balance', key: 'agents' } as const, [])
 const reportsAtom = atom({ plugin: 'model-balance', key: 'reports' } as const, [])
+const handoffsAtom = atom({ plugin: 'model-balance', key: 'handoffs' } as const, [])
 const historyOpenAtom = atom({ plugin: 'model-balance', key: 'isHistoryOpen' } as const, false)
 const paneDismissedAtom = atom({ plugin: 'model-balance', key: 'isPaneDismissed' } as const, false)
 
@@ -170,6 +189,18 @@ const BOARD_FINISHED_SHOWN = 6
 /** Worker reports kept for later workers, and how many of them a new worker reads. */
 const REPORTS_KEPT = 8
 const REPORTS_IN_PROMPT = 4
+
+/** Handoffs kept, newest first: enough for every subagent the board holds. */
+const HANDOFFS_KEPT = 12
+
+/**
+ * Why an automatic compaction is skipped. docs/settings-reference → autoCompactEnabled: with auto-compaction
+ * off the manual /compact keeps working and idle compaction is off too. Of the compaction triggers, `auto`
+ * and `precompute` are the engine's own and `manual` and `plugin` a person's or a plugin's call, so skipping
+ * the first two mirrors that setting for this session alone, leaving the person's settings as they are.
+ */
+const AUTO_COMPACT_SKIP =
+  'model-balance is on, so auto-compaction is off in this session: run /compact yourself, or /model-balance off to have it compact on its own again.'
 
 /** Wide enough for `model-balance · main`, so terminal rows line their figures up in one column. */
 const TERMINAL_LABEL_WIDTH = 22
@@ -371,6 +402,9 @@ async function trackSpawn(
         startedAt: now,
         model: started.model,
         window,
+        ...(canHandOffSpawn(e) ? { canHandOff: true } : {}),
+        // A resumed agent that was asked to hand off keeps the mark: it is not asked again.
+        ...(known?.handoffAt === undefined ? {} : { handoffAt: known.handoffAt }),
       }
 
       return upsertAgent(rows, row, BOARD_AGENTS)
@@ -378,6 +412,58 @@ async function trackSpawn(
   } catch {
     // The board misses this run; the spawn itself is unaffected.
   }
+}
+
+/**
+ * Asks a subagent past the handoff point to finish its step and hand off, once: the record goes in first,
+ * so a send that fails is not retried on every later step.
+ *
+ * docs/sub-agents: a message to a subagent whose run has ended resumes it, so the caller only asks one
+ * whose step went on to a tool call; the message drains at that tool round.
+ */
+async function requestHandoff(
+  $: EngineInterface,
+  row: AgentRow,
+  request: { tokens: number; window: number; model: string; effort: Handoff['effort'] },
+): Promise<void> {
+  const { tokens, window, model, effort } = request
+  const record: Handoff = {
+    agentId: row.id,
+    type: row.type,
+    description: row.description,
+    model,
+    ...(effort === undefined ? {} : { effort }),
+    tokens,
+    window,
+    at: await $.clock.now(),
+    status: 'requested',
+  }
+  const percent = percentOf(tokens, window)
+  await update($, handoffsAtom, list => pushHandoff(list, record, HANDOFFS_KEPT))
+  await update($, agentsAtom, rows => patchAgent(rows, row.id, { handoffAt: percent }))
+
+  const sent = await $.session.send({ to: { agentId: row.id }, text: handoffRequest({ tokens, window }) })
+  if (!sent.isDelivered) {
+    await update($, handoffsAtom, list => patchHandoff(list, row.id, { status: 'ended' }))
+    $.ui.status(`model-balance: ${agentLabel(row)} at ${percent}% context, handoff not delivered (${sent.reason})`)
+
+    return
+  }
+  $.ui.toast(`model-balance: ${agentLabel(row)} at ${percent}% context, asked to hand off`)
+}
+
+/**
+ * The continuation notes for the handoffs a notification or an Agent result names, each marked announced
+ * so main is told once.
+ */
+async function announceHandoffs($: EngineInterface, text: string): Promise<string[]> {
+  const named = handoffsNamedIn(await read($, handoffsAtom), text)
+  if (named.length === 0) return []
+  await update($, handoffsAtom, list =>
+    named.reduce((acc, one) => patchHandoff(acc, one.agentId, { status: 'announced' }), list),
+  )
+
+  return named.map(continuationNote)
 }
 
 /** Opens the board's pane in VS Code, which draws no band, unless the person closed it this session. */
@@ -416,6 +502,7 @@ const drawBoard = (
     const tail = [
       row.outputTokens === undefined || row.status === 'running' ? '' : ` · out ${formatTokens(row.outputTokens)}`,
       row.effort === undefined ? '' : ` · effort ${row.effort}`,
+      row.handoffAt === undefined ? '' : ` · handoff at ${row.handoffAt}%`,
       row.description === '' ? '' : ` · ${row.description}`,
     ].join('')
 
@@ -589,11 +676,23 @@ export const register: Register = (on, options) => {
     const usage = 'Use /model-balance on|off for this session, /model-balance default on|off for new sessions, /model-balance context for every context window, /model-balance panel to open or close the board.'
 
     return {
-      text: `${command.isUnknown ? `Unknown argument "${e.args.trim()}". ` : ''}model-balance is ${onOff(await isEnabled($))} for this session (new sessions start ${onOff(await readDefault($))}). Main model: ${main}. Router: ${routerModel}. Worker effort: ${efforts} (never above xhigh). ${usage} Prefix a prompt with #haiku, #sonnet or #opus to force a worker, or #main to skip routing.`,
+      text: `${command.isUnknown ? `Unknown argument "${e.args.trim()}". ` : ''}model-balance is ${onOff(await isEnabled($))} for this session (new sessions start ${onOff(await readDefault($))}). Main model: ${main}. Router: ${routerModel}. Worker effort: ${efforts} (never above xhigh). While on, auto-compaction is off in main and every subagent (/compact still works), and a subagent past ${Math.round(HANDOFF_RATIO * 100)}% of its context hands its work to a fresh one on the same model and effort. ${usage} Prefix a prompt with #haiku, #sonnet or #opus to force a worker, or #main to skip routing.`,
     }
   })
 
   on('prompt.submit', async ($, e, next) => {
+    // A background agent's report arrives in a notification naming its id: a handoff in it gets main's
+    // continuation note, whether or not routing is still on, so a task cut at the context limit goes on.
+    if (e.origin.kind === 'task-notification') {
+      let notes: string[] = []
+      try {
+        notes = await announceHandoffs($, e.text)
+      } catch {
+        // The notification goes on as it came; on a routed turn main's note says what a handoff line asks.
+      }
+
+      return next(notes.length === 0 ? e : { ...e, context: [...(e.context ?? []), ...notes] })
+    }
     if (!ROUTED_ORIGINS.has(e.origin.kind) || !(await isEnabled($))) return next(e)
 
     const { override, rest } = readOverride(e.text)
@@ -650,12 +749,31 @@ export const register: Register = (on, options) => {
    * One top-level worker writes at a time: a second spawn while one runs is refused, whoever asks for it.
    * A worker starts from main's handoff with the session's record beside it; every other subagent passes
    * untouched and only goes on the board.
+   *
+   * A spawn that continues a handoff (findContinuation) runs as the agent type and on the model of the one
+   * that handed off, with its report whole ahead of main's prompt; turn.step pins its effort.
    */
-  on('agent.spawn', async ($, e, next) => {
+  on('agent.spawn', async ($, input, next) => {
+    const isNewTopLevel = canHandOffSpawn(input) && input.resume === undefined
+    const continuation = isNewTopLevel ? findContinuation(await read($, handoffsAtom), input) : undefined
+    const e: AgentSpawnInput =
+      continuation === undefined ? input : { ...input, subagentType: continuation.type, model: continuation.model }
+    // Never throws, so what follows it in the hook (the status line, the editor pane) still runs.
+    const markContinued = async (started: AgentSpawnResult): Promise<void> => {
+      const agentId = started.agentId
+      if (continuation === undefined || agentId === undefined || started.deny !== undefined) return
+      try {
+        await update($, handoffsAtom, list => patchHandoff(list, continuation.agentId, { status: 'continued', continuedBy: agentId }))
+        $.ui.toast(`model-balance: ${handoffLabel(continuation)} ${agentId} continues the handoff of ${continuation.agentId}`)
+      } catch {
+        // The successor runs with the report already in its prompt; only the effort pin and the record miss it.
+      }
+    }
     const tier = tierOfWorker(e.subagentType)
     if (tier === undefined || e.fork || e.parentAgentId !== undefined || e.resume !== undefined) {
-      const started = await next(e)
+      const started = await next(continuation === undefined ? e : { ...e, prompt: `${handoffBlock(continuation)}\n\n${e.prompt}` })
       await trackSpawn($, workers, e, started, tier)
+      await markContinued(started)
 
       return started
     }
@@ -667,7 +785,9 @@ export const register: Register = (on, options) => {
       }
     }
 
-    const earlier = formatReports(await read($, reportsAtom), REPORTS_IN_PROMPT)
+    // The worker handing off reaches its successor whole, in its own block, not clipped among the others.
+    const reports = (await read($, reportsAtom)).filter(one => one.id !== continuation?.agentId)
+    const earlier = formatReports(reports, REPORTS_IN_PROMPT)
     const excerpt = excerptOf(await $.session.messages())
     const memory = await readMemoryIndex($)
     // Long material first and the task last, as docs/long-context-tips lays out a prompt.
@@ -675,15 +795,17 @@ export const register: Register = (on, options) => {
       memory === undefined ? '' : `<auto_memory dir="${directoryOf(memory.path)}">\n${memory.text}\n</auto_memory>`,
       excerpt === '' ? '' : `<recent_messages>\n${excerpt}\n</recent_messages>`,
       earlier === '' ? '' : `<earlier_workers>\n${earlier}\n</earlier_workers>`,
+      continuation === undefined ? '' : handoffBlock(continuation),
       `<handoff>\n${e.prompt}\n</handoff>`,
     ]
       .filter(part => part !== '')
       .join('\n\n')
-    const started = await next({ ...e, prompt, model: tier })
+    const started = await next({ ...e, prompt, model: continuation?.model ?? tier })
     if (started.agentId !== undefined && started.deny === undefined) {
       lastWorkerId = started.agentId
       rememberLatest(workerTasks, started.agentId, e.prompt, BOARD_AGENTS)
       await trackSpawn($, workers, e, started, tier)
+      await markContinued(started)
       $.ui.status(`model-balance ▶ ${tier} worker: ${e.description}`)
       try {
         await openPaneInEditor($)
@@ -699,6 +821,39 @@ export const register: Register = (on, options) => {
 
     return next.called || tier === undefined ? next(e) : next({ ...e, model: tier })
   })
+
+  /**
+   * While routing is on, nothing compacts on its own, in main or in any subagent: a subagent hands off at
+   * the threshold instead (turn.step), and the person compacts main with /compact when they choose.
+   */
+  on('session.compact', { trigger: ['auto', 'precompute'] }, async ($, e, next) =>
+    (await isEnabled($)) ? { skip: AUTO_COMPACT_SKIP } : next(e),
+  ).catch(($, e, next) =>
+    // Failing open: a compaction that runs is better than a conversation left too long for its window.
+    next(e),
+  )
+
+  /**
+   * A subagent run in the foreground hands its report back as the Agent tool's result, not in a
+   * notification: a handoff there gets main's continuation note beside the result.
+   */
+  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    const called = await next(e)
+    if (called.deny !== undefined || called.isError === true) return called
+    const { result } = called
+    if (!('status' in result) || result.status !== 'completed') return called
+    try {
+      const notes = await announceHandoffs($, result.agentId)
+
+      return notes.length === 0 ? called : { ...called, context: [...(called.context ?? []), ...notes] }
+    } catch {
+      // Main still reads the report; on a routed turn its note says what the report's handoff line asks.
+      return called
+    }
+  }).catch(($, e, next) =>
+    // `next` is replay-safe here: the agent's result as it came back, nothing run again.
+    next(e),
+  )
 
   /**
    * A routed turn's editing is the worker's: main's own file edits are refused, except in the auto-memory
@@ -794,16 +949,22 @@ export const register: Register = (on, options) => {
   })
 
   /**
-   * Every subagent request is held below `max`, the person's ceiling for subagents, and its usage puts the
-   * agent's context fill and effort on the board.
+   * Every subagent request is held below `max`, the person's ceiling for subagents, and an agent continuing
+   * a handoff runs at its predecessor's effort. Its usage puts the agent's context fill and effort on the
+   * board, and asks an agent past the handoff point to hand off while routing is on.
    */
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined) return yield* next(e)
 
-    const capped = cappedSubagentEffort(e.effort)
-    const effort = capped ?? e.effort
-    const step = yield* next(capped === undefined ? e : { ...e, effort: capped })
     const agentId = e.agentId
+    let pinned: Handoff['effort']
+    try {
+      pinned = pinnedEffortOf(await read($, handoffsAtom), agentId)
+    } catch {
+      // The request runs at its own effort, still held below max.
+    }
+    const effort = subagentEffortOf(pinned ?? e.effort)
+    const step = yield* next(effort === e.effort ? e : { ...e, effort })
     const usage = step.usage
     if (usage !== null) {
       try {
@@ -811,27 +972,58 @@ export const register: Register = (on, options) => {
         if (row !== undefined) {
           const model = row.model ?? usage.model
           const window = row.model === undefined ? contextWindowOf(model, await readWindowEnv($)) : row.window
+          const tokens = contextTokensOf(usage)
           await update($, agentsAtom, rows =>
             patchAgent(rows, agentId, {
-              contextTokens: contextTokensOf(usage),
+              contextTokens: tokens,
               model,
               window,
               ...(effort === undefined ? {} : { effort: String(effort) }),
             }),
           )
+          if (
+            row.canHandOff === true &&
+            row.handoffAt === undefined &&
+            step.stopReason === 'tool_use' &&
+            isPastHandoffPoint(tokens, window)
+          ) {
+            const isAsked = (await read($, handoffsAtom)).some(one => one.agentId === agentId)
+            if (!isAsked && (await isEnabled($))) await requestHandoff($, row, { tokens, window, model: usage.model, effort })
+          }
         }
       } catch {
-        // The board keeps the previous figures; the step itself is done.
+        // The board keeps the previous figures and no handoff is asked this step; the step itself is done.
       }
     }
 
     return step
   })
 
-  /** A subagent's run ended: its row closes, and a worker's report joins the session's record. */
+  /**
+   * A subagent's run ended: its row closes, a worker's report joins the session's record, and an agent that
+   * was asked to hand off has its report read for work remaining.
+   */
   on('turn.complete', async ($, e, next) => {
     const agentId = e.agentId
     if (agentId !== undefined) {
+      try {
+        // `complete` is read again: a run resumed after it finished may still hand off.
+        const handoff = (await read($, handoffsAtom)).find(
+          one => one.agentId === agentId && (one.status === 'requested' || one.status === 'complete'),
+        )
+        if (handoff !== undefined) {
+          const report = e.answer.trim()
+          const change: Partial<Handoff> =
+            e.reason !== 'answer'
+              ? { status: 'ended' }
+              : readHandoffOutcome(report) === 'continue'
+                ? { status: 'reported', report }
+                : { status: 'complete' }
+          await update($, handoffsAtom, list => patchHandoff(list, agentId, change))
+        }
+      } catch {
+        // Main still reads the report and its handoff line; only the continuation's attachments miss it.
+      }
       try {
         const tier = await workerTier($, workers, agentId)
         const now = await $.clock.now()

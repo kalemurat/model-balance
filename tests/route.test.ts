@@ -50,7 +50,26 @@ import {
   SAVED_TOGGLE_TTL_MS,
   tierOfWorker,
   workerType,
+  HANDOFF_COMPLETE,
+  HANDOFF_CONTINUE,
+  HANDOFF_RATIO,
+  canHandOffSpawn,
+  continuationNote,
+  continuesLine,
+  findContinuation,
+  handoffBlock,
+  handoffLabel,
+  handoffRequest,
+  handoffsNamedIn,
+  isPastHandoffPoint,
+  patchHandoff,
+  pinnedEffortOf,
+  pushHandoff,
+  readHandoffOutcome,
+  stripRoutingNote,
+  subagentEffortOf,
 } from '../hooks/route'
+import type { Handoff } from '../types'
 
 test('an override prefix is read and stripped', async () => {
   expect(readOverride('#opus redesign the store')).toEqual({ override: 'opus', rest: 'redesign the store' })
@@ -398,4 +417,147 @@ test('the context subcommand is read and the report lists main and agents', asyn
   expect(report).toContain('opus worker  ███░░░░░░░ 26% · 52k / 200k  (completed)')
   expect(report).toContain('Explore  no request yet  (running)')
   expect(formatContextReport({ label: 'main', window: 200_000 }, [])).toContain('no agents yet')
+})
+
+const handoff = (change: Partial<Handoff> = {}): Handoff => ({
+  agentId: 'a-1',
+  type: 'model-balance:opus-worker',
+  description: 'Migrate the store',
+  model: 'claude-opus-5-5',
+  effort: 'xhigh',
+  tokens: 650_000,
+  window: 1_000_000,
+  at: 0,
+  status: 'reported',
+  report: '## Handoff: stopped at the context limit.\n## Remaining:\n1. Port the last two selectors.\n[handoff: continue]',
+  ...change,
+})
+
+test('the handoff point is 65% of the window, reached at the boundary itself', async () => {
+  expect(HANDOFF_RATIO).toBe(0.65)
+  expect(isPastHandoffPoint(649_999, 1_000_000)).toBe(false)
+  expect(isPastHandoffPoint(650_000, 1_000_000)).toBe(true)
+  expect(isPastHandoffPoint(130_000, 200_000)).toBe(true)
+  expect(isPastHandoffPoint(129_999, 200_000)).toBe(false)
+  expect(isPastHandoffPoint(10, 0)).toBe(false)
+  expect(isPastHandoffPoint(500, 1000, 0.5)).toBe(true)
+})
+
+test('only an agent main spawned itself can be started again from a handoff', async () => {
+  expect(canHandOffSpawn({ fork: false })).toBe(true)
+  expect(canHandOffSpawn({ fork: true })).toBe(false)
+  expect(canHandOffSpawn({ fork: false, parentAgentId: 'a-0' })).toBe(false)
+  expect(canHandOffSpawn({ fork: false, isTeammate: true })).toBe(false)
+  expect(canHandOffSpawn({ fork: false, workflow: { runId: 'wf_1', agentIndex: 1 } })).toBe(false)
+})
+
+test('a handoff report says whether work remains: its last marker, else its Remaining section', async () => {
+  expect(readHandoffOutcome(`## Done\nx\n${HANDOFF_CONTINUE}`)).toBe('continue')
+  expect(readHandoffOutcome(`## Result\ndone\n${HANDOFF_COMPLETE}`)).toBe('complete')
+  expect(readHandoffOutcome('[handoff: continue]\n...\n[Handoff: Complete]')).toBe('complete')
+  expect(readHandoffOutcome('[handoff:continue ]')).toBe('continue')
+  expect(readHandoffOutcome('## Remaining\n1. Port the selectors\n## Questions\nnone')).toBe('continue')
+  expect(readHandoffOutcome('## Remaining: 1. Port the selectors')).toBe('continue')
+  expect(readHandoffOutcome('## Remaining\nNone.\n## Questions\n- asked X')).toBe('complete')
+  expect(readHandoffOutcome('## Remaining: none')).toBe('complete')
+  expect(readHandoffOutcome('## Remaining\n- yok')).toBe('complete')
+  expect(readHandoffOutcome('## Remaining\n')).toBe('complete')
+  expect(readHandoffOutcome('## Result\nAll done.')).toBe('complete')
+  expect(readHandoffOutcome('')).toBe('complete')
+})
+
+test('the handoff request names the fill, the headings and both closing lines', async () => {
+  const text = handoffRequest({ tokens: 652_300, window: 1_000_000 })
+  expect(text.startsWith(`${MARK_OPEN} Context handoff`)).toBe(true)
+  expect(text).toContain('65% full (652k of 1M tokens)')
+  expect(text).toContain('past the 65% handoff point')
+  for (const heading of ['## Handoff', '## Task', '## Done', '## State', '## Remaining', '## Decisions & findings', '## Questions']) {
+    expect(text).toContain(heading)
+  }
+  expect(text).toContain(`End with the line ${HANDOFF_CONTINUE}`)
+  expect(text).toContain(HANDOFF_COMPLETE)
+  expect(text).toContain('same model and effort')
+  expect(text.endsWith(MARK_CLOSE)).toBe(true)
+})
+
+test('a continuation is the handoff its prompt names, else the one pending of its type', async () => {
+  const opus = handoff()
+  const sonnet = handoff({ agentId: 'a-2', type: 'model-balance:sonnet-worker', status: 'announced' })
+  const done = handoff({ agentId: 'a-3', status: 'continued', continuedBy: 'a-9' })
+  const list = [opus, sonnet, done]
+
+  expect(findContinuation(list, { subagentType: 'general-purpose', prompt: `Carry on.\n${continuesLine('a-2')}\n` })).toBe(sonnet)
+  expect(findContinuation(list, { subagentType: 'model-balance:opus-worker', prompt: 'Carry on.' })).toBe(opus)
+  expect(findContinuation(list, { subagentType: 'model-balance:opus-worker', prompt: `  Continues:  a-1  ` })).toBe(opus)
+  // Named in passing is not named: the line stands on its own.
+  expect(findContinuation(list, { subagentType: 'Explore', prompt: 'like Continues: a-1 did' })).toBeUndefined()
+  // A finished one is never continued twice.
+  expect(findContinuation(list, { subagentType: 'Explore', prompt: continuesLine('a-3') })).toBeUndefined()
+  // Two pending of one type and neither named: none is guessed.
+  const twin = handoff({ agentId: 'a-4' })
+  expect(findContinuation([opus, twin], { subagentType: 'model-balance:opus-worker', prompt: 'Carry on.' })).toBeUndefined()
+  expect(findContinuation([opus, twin], { subagentType: 'model-balance:opus-worker', prompt: continuesLine('a-4') })).toBe(twin)
+  for (const status of ['requested', 'complete', 'ended'] as const) {
+    expect(findContinuation([handoff({ status })], { subagentType: 'model-balance:opus-worker', prompt: continuesLine('a-1') })).toBeUndefined()
+  }
+})
+
+test('a notification names the reported handoffs it carries; pinned effort follows the predecessor', async () => {
+  const list = [handoff(), handoff({ agentId: 'a-2', status: 'announced' }), handoff({ agentId: 'a-3', status: 'requested' })]
+  const text = '<task-notification>\n<task-id>a-1</task-id>\n<status>completed</status>\n</task-notification>'
+  expect(handoffsNamedIn(list, text).map(one => one.agentId)).toEqual(['a-1'])
+  expect(handoffsNamedIn(list, '<task-notification><task-id>a-2</task-id>')).toEqual([])
+  expect(handoffsNamedIn(list, '<task-notification><task-id>a-3</task-id>')).toEqual([])
+
+  const chain = [handoff({ status: 'continued', continuedBy: 'a-5', effort: 'high' }), handoff({ agentId: 'a-6', continuedBy: 'a-7', effort: 4096 })]
+  expect(pinnedEffortOf(chain, 'a-5')).toBe('high')
+  expect(pinnedEffortOf(chain, 'a-7')).toBe(4096)
+  expect(pinnedEffortOf(chain, 'a-1')).toBeUndefined()
+})
+
+test('handoffs are kept newest first, replaced by agent and patched in place', async () => {
+  const first = handoff({ agentId: 'a-1', status: 'requested' })
+  const second = handoff({ agentId: 'a-2', status: 'requested' })
+  const list = pushHandoff(pushHandoff([], first, 2), second, 2)
+  expect(list.map(one => one.agentId)).toEqual(['a-2', 'a-1'])
+  expect(pushHandoff(list, handoff({ agentId: 'a-3' }), 2).map(one => one.agentId)).toEqual(['a-3', 'a-2'])
+  expect(pushHandoff(list, handoff({ agentId: 'a-1', status: 'reported' }), 2).map(one => [one.agentId, one.status])).toEqual([
+    ['a-1', 'reported'],
+    ['a-2', 'requested'],
+  ])
+  expect(patchHandoff(list, 'a-1', { status: 'complete' }).map(one => one.status)).toEqual(['requested', 'complete'])
+  expect(patchHandoff(list, 'a-9', { status: 'complete' })).toEqual(list)
+})
+
+test('a subagent request runs at its own effort, max held at xhigh', async () => {
+  expect(subagentEffortOf('max')).toBe('xhigh')
+  expect(subagentEffortOf('high')).toBe('high')
+  expect(subagentEffortOf(2048)).toBe(2048)
+  expect(subagentEffortOf(undefined)).toBeUndefined()
+})
+
+test("main's continuation note names the agent, the type, the line to copy and what the router pins", async () => {
+  const note = continuationNote(handoff())
+  expect(note.startsWith(MARK_OPEN)).toBe(true)
+  expect(note.endsWith(MARK_CLOSE)).toBe(true)
+  expect(note).toContain('opus worker a-1 ("Migrate the store") stopped at 65%')
+  expect(note).toContain('subagent_type "model-balance:opus-worker"')
+  expect(note).toContain('"Migrate the store (cont.)"')
+  expect(note).toContain(`\n${continuesLine('a-1')}\n`)
+  expect(note).toContain('same model (claude-opus-5-5) and effort xhigh')
+  expect(continuationNote(handoff({ effort: undefined, description: '' }))).toContain('and its effort')
+  expect(handoffLabel({ type: 'general-purpose' })).toBe('general-purpose')
+  expect(handoffLabel({ type: 'model-balance:haiku-worker' })).toBe('haiku worker')
+  // The note never reaches a worker through the excerpt of main's messages.
+  expect(stripRoutingNote(`<task-notification>x</task-notification>\n${note}`)).toBe('<task-notification>x</task-notification>')
+})
+
+test('the continuing agent gets the handoff report whole, never clipped', async () => {
+  const report = `## Handoff: stopped.\n## Remaining:\n${'1. a step that matters\n'.repeat(400)}${HANDOFF_CONTINUE}`
+  const block = handoffBlock(handoff({ report }))
+  expect(report.length).toBeGreaterThan(5000)
+  expect(block).toContain(report)
+  expect(block.startsWith('<previous_agent_handoff agent="a-1" type="model-balance:opus-worker" context="65%">')).toBe(true)
+  expect(block).toContain('same model and effort as you')
+  expect(block.endsWith('</previous_agent_handoff>')).toBe(true)
 })

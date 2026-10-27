@@ -1,6 +1,6 @@
 import type { ModelEffort, SessionMessage } from 'claude-code'
 
-import type { AgentRow, WorkerReport } from '../types'
+import type { AgentRow, Handoff, HandoffEffort, WorkerReport } from '../types'
 
 export type Tier = 'haiku' | 'sonnet' | 'opus'
 
@@ -262,6 +262,10 @@ export const readWorkerEffort = (value: unknown, tier: Tier): WorkerEffort =>
  */
 export const cappedSubagentEffort = (effort: ModelEffort | number | undefined): SubagentEffort | undefined =>
   effort === 'max' ? 'xhigh' : undefined
+
+/** The effort a subagent request runs at: as asked, `max` held at `xhigh`. */
+export const subagentEffortOf = (effort: ModelEffort | number | undefined): HandoffEffort | undefined =>
+  cappedSubagentEffort(effort) ?? (effort as HandoffEffort | undefined)
 
 /** Whether the classifier judged the request a continuation of the last worker's task. */
 export const isContinuationReply = (reply: string): boolean => /\bCONTINUE\b/i.test(reply)
@@ -586,3 +590,141 @@ export const formatContextReport = (main: ContextLine, agents: readonly ContextL
     ...(agents.length === 0 ? ['  no agents yet'] : agents.map(contextRow)),
     'Agent windows follow the documented model table (native 1M models, [1m] variants, CLAUDE_CODE_DISABLE_1M_CONTEXT); main uses the engine\'s own.',
   ].join('\n')
+
+/**
+ * The share of its context window at which a subagent is asked to hand its work over to a fresh agent of
+ * the same model and effort. Auto-compaction is off while the router is on, so this is what keeps a long
+ * task inside a window.
+ */
+export const HANDOFF_RATIO = 0.65
+
+/** Whether a request answered over `tokens` has reached the handoff point of `window`. */
+export const isPastHandoffPoint = (tokens: number, window: number, ratio = HANDOFF_RATIO): boolean =>
+  window > 0 && tokens >= window * ratio
+
+/**
+ * Whether main can start this spawn's agent again from a handoff: one main spawned itself. A fork starts
+ * from main's own context, a teammate and a workflow agent belong to their team or script, and a nested
+ * agent would have to be started again by its parent, not by main.
+ */
+export const canHandOffSpawn = (spawn: {
+  fork: boolean
+  parentAgentId?: string
+  isTeammate?: true
+  workflow?: unknown
+}): boolean =>
+  !spawn.fork && spawn.parentAgentId === undefined && spawn.isTeammate === undefined && spawn.workflow === undefined
+
+/** The line a handoff report ends with: whether work remains for the agent that continues it. */
+export const HANDOFF_CONTINUE = '[handoff: continue]'
+export const HANDOFF_COMPLETE = '[handoff: complete]'
+
+/** A `## Remaining` section that holds nothing to do. */
+const NOTHING_REMAINING = /^[\s:.\-–—]*(none|nothing|nothing left|n\/a|yok|kalan iş yok)?[\s.]*$/i
+
+/**
+ * What a run that was asked to hand off ended with: its last `[handoff: …]` line, else a `## Remaining`
+ * section with something in it, else `complete`, as a run that wrote neither finished its task.
+ */
+export const readHandoffOutcome = (report: string): 'continue' | 'complete' => {
+  const marks = [...report.matchAll(/\[handoff:\s*(continue|complete)\s*\]/gi)]
+  const last = marks.at(-1)?.[1]
+  if (last !== undefined) return last.toLowerCase() === 'continue' ? 'continue' : 'complete'
+
+  const lines = report.split('\n')
+  const start = lines.findIndex(line => /^#{1,6}\s*Remaining\b/i.test(line.trim()))
+  if (start === -1) return 'complete'
+  const rest = lines.slice(start + 1)
+  const end = rest.findIndex(line => /^#{1,6}\s/.test(line.trim()))
+  const heading = lines[start]!.trim().replace(/^#{1,6}\s*Remaining\b/i, '')
+  const body = [heading, ...(end === -1 ? rest : rest.slice(0, end))].join('\n').trim()
+
+  return NOTHING_REMAINING.test(body) ? 'complete' : 'continue'
+}
+
+/**
+ * The message a subagent past the handoff point receives: finish the step under way, then end the run with
+ * a report the next agent can continue from without a gap.
+ */
+export const handoffRequest = ({ tokens, window }: { tokens: number; window: number }): string =>
+  `${MARK_OPEN} Context handoff: your context window is ${percentOf(tokens, window)}% full (${formatTokens(tokens)} of ${formatTokens(window)} tokens), past the ${Math.round(HANDOFF_RATIO * 100)}% handoff point, and auto-compaction is off.
+Finish only the step you are in now (the edit, file or check under way), leave the working tree consistent with no half-applied change, and start nothing new. Then end your run: your final message is a handoff report. A fresh agent on the same model and effort continues the task from it alone; it has not seen your conversation, so leave no gap. The usual length limit on your report does not apply. Write it under these headings, in the language the user writes in:
+## Handoff: one line saying you stopped at the context limit.
+## Task: the task as you were given it, in full, with every decision, constraint and correction added since.
+## Done: every step finished; each file changed, by path, with what changed in it; what you verified and how.
+## State: exactly where you stopped; what is in progress, unverified, uncommitted or still running.
+## Remaining: a numbered list of every step still to do, concrete enough to act on without asking: files, symbols, commands, order, and what done means.
+## Decisions & findings: what you decided or learned that the next agent must know, including what failed and must not be retried.
+## Questions: each question asked of the user, with its answer, and any still open.
+End with the line ${HANDOFF_CONTINUE}. Only if the step you just finished completed the whole task, report as usual instead and end with ${HANDOFF_COMPLETE}.
+${MARK_CLOSE}`
+
+/** The line main puts in a continuing agent's prompt to name the handoff it continues. */
+export const continuesLine = (agentId: string): string => `Continues: ${agentId}`
+
+/** Handoffs that ended with work remaining and wait for an agent to continue them. */
+const isPendingHandoff = (handoff: Handoff): boolean => handoff.status === 'reported' || handoff.status === 'announced'
+
+/**
+ * The handoff a new spawn continues: the pending one its prompt names on a `Continues: <id>` line, else the
+ * one pending handoff of its agent type when there is exactly one.
+ */
+export const findContinuation = (
+  handoffs: readonly Handoff[],
+  spawn: { subagentType: string; prompt: string },
+): Handoff | undefined => {
+  const pending = handoffs.filter(isPendingHandoff)
+  const named = pending.find(one => new RegExp(`^\\s*Continues:\\s*${escape(one.agentId)}\\s*$`, 'm').test(spawn.prompt))
+  if (named !== undefined) return named
+  const ofType = pending.filter(one => one.type === spawn.subagentType)
+
+  return ofType.length === 1 ? ofType[0] : undefined
+}
+
+/** The handoffs waiting for main whose agent a notification names: each gets its continuation note once. */
+export const handoffsNamedIn = (handoffs: readonly Handoff[], text: string): Handoff[] =>
+  handoffs.filter(one => one.status === 'reported' && text.includes(one.agentId))
+
+/** The effort an agent's requests are pinned to: its predecessor's, when it continues a handoff. */
+export const pinnedEffortOf = (handoffs: readonly Handoff[], agentId: string): HandoffEffort | undefined =>
+  handoffs.find(one => one.continuedBy === agentId)?.effort
+
+/** Sets `handoff` as the newest entry, dropping its earlier copy and the oldest past `max`. */
+export const pushHandoff = (handoffs: readonly Handoff[], handoff: Handoff, max: number): Handoff[] =>
+  [handoff, ...handoffs.filter(one => one.agentId !== handoff.agentId)].slice(0, max)
+
+/** Applies `change` to the handoff of `agentId`; the list is returned unchanged when none is listed. */
+export const patchHandoff = (handoffs: readonly Handoff[], agentId: string, change: Partial<Handoff>): Handoff[] =>
+  handoffs.map(one => (one.agentId === agentId ? { ...one, ...change } : one))
+
+/** The label a handoff's agent goes by: `opus worker`, or its agent type. */
+export const handoffLabel = (handoff: Pick<Handoff, 'type'>): string => {
+  const tier = tierOfWorker(handoff.type)
+
+  return agentLabel(tier === undefined ? { type: handoff.type } : { tier, type: handoff.type })
+}
+
+const effortText = (effort: HandoffEffort | undefined): string => (effort === undefined ? 'its effort' : `effort ${effort}`)
+
+/**
+ * What main is told once an agent handed off with work remaining: continue it at once in a fresh agent of
+ * the same type, naming the handoff; the router attaches the report and pins the model and effort itself.
+ */
+export const continuationNote = (handoff: Handoff): string => `${MARK_OPEN}
+The ${handoffLabel(handoff)} ${handoff.agentId}${handoff.description === '' ? '' : ` ("${handoff.description}")`} stopped at ${percentOf(handoff.tokens, handoff.window)}% of its context window and handed off: its report lists what it did and what remains. The task is not finished.
+Continue it now, before anything else, and do not do the work yourself: call the Agent tool once with subagent_type "${handoff.type}", a short description such as "${handoff.description === '' ? 'Continue' : handoff.description} (cont.)", and a prompt that restates the brief you gave it, with the user's corrections since, and holds this line verbatim on a line of its own:
+${continuesLine(handoff.agentId)}
+The router attaches that agent's whole handoff report to the new agent's prompt and holds it to the same model (${handoff.model}) and ${effortText(handoff.effort)}, so pass no model or effort and do not shorten the report into your prompt.
+Tell the user in one sentence that the work goes on in a fresh agent of the same model and effort, then wait for its report as for any worker: it may hand off again the same way.
+${MARK_CLOSE}`
+
+/**
+ * The block a continuing agent's prompt opens with: the handoff it continues, verbatim. Placed before the
+ * brief, as long material goes before the task (docs/long-context-tips).
+ */
+export const handoffBlock = (handoff: Handoff): string =>
+  `<previous_agent_handoff agent="${handoff.agentId}" type="${handoff.type}" context="${percentOf(handoff.tokens, handoff.window)}%">
+You continue the work of another agent. It ran on the same model and effort as you and stopped at ${percentOf(handoff.tokens, handoff.window)}% of its context window; its handoff report follows verbatim. Take up exactly where it stopped: do not redo the steps it finished, check the state it describes where that is cheap before building on it, then work through its Remaining list. If your own context fills, you will be asked to hand off the same way.
+
+${handoff.report ?? ''}
+</previous_agent_handoff>`

@@ -1,6 +1,11 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  isInScope,
+  readScope,
+  scopeText,
+  scopesOverlap,
+  writersOf,
   shortModelName,
   DEFAULT_WORKER_EFFORT,
   agentLabel,
@@ -661,4 +666,45 @@ test('the board names a model without its claude- prefix', () => {
   expect(shortModelName('claude-opus-5-5[1m]')).toBe('opus-5-5[1m]')
   expect(shortModelName('us.anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('haiku-4-5-20251001-v1:0')
   expect(shortModelName('sonnet')).toBe('sonnet')
+})
+
+test("a part's scope is read from its brief, relative to the working directory", () => {
+  expect(readScope('## Request: x\n## Scope: be/\n## Contract: y', '/work')).toEqual(['be'])
+  expect(readScope('## Scope: `be/`, ./fe/ (the app), /work/docs/api/', '/work/')).toEqual(['be', 'fe', 'docs/api'])
+  expect(readScope('## Scope\n- be/\n- /other/shared\n## Contract: y', '/work')).toEqual(['be', '/other/shared'])
+  // None named, or the working directory itself: the whole tree.
+  expect(readScope('## Request: x', '/work')).toBeUndefined()
+  expect(readScope('## Scope: .', '/work')).toBeUndefined()
+  expect(readScope('## Scope: be/, /work', '/work')).toBeUndefined()
+})
+
+test('scopes overlap where one directory holds the other; a writer with none overlaps every scope', () => {
+  expect(scopesOverlap(['be'], ['fe'])).toBe(false)
+  expect(scopesOverlap(['be'], ['be/api'])).toBe(true)
+  expect(scopesOverlap(['be'], ['bel'])).toBe(false)
+  expect(scopesOverlap(undefined, ['fe'])).toBe(true)
+  expect(scopeText(['be', 'docs/api'])).toBe('be/, docs/api/')
+})
+
+test('a file is in scope only inside one of its directories, with .. resolved first', () => {
+  expect(isInScope('/work/be/src/a.ts', ['be'], '/work')).toBe(true)
+  expect(isInScope('/work/fe/src/a.ts', ['be'], '/work')).toBe(false)
+  expect(isInScope('/work/be/../fe/a.ts', ['be'], '/work')).toBe(false)
+  expect(isInScope('/work/bel/a.ts', ['be'], '/work')).toBe(false)
+  expect(isInScope('/other/shared/a.ts', ['/other/shared'], '/work')).toBe(true)
+})
+
+test('the writers are the top-level workers and forks still running, with their pinned scopes', () => {
+  const agents = [
+    { id: 'a-1', type: 'model-balance:opus-worker', status: 'running', description: '' },
+    { id: 'a-2', type: 'fork', status: 'pending', description: '' },
+    { id: 'a-3', type: 'model-balance:haiku-worker', status: 'completed', description: '' },
+    { id: 'a-4', type: 'Explore', status: 'running', description: '' },
+    { id: 'a-5', type: 'model-balance:sonnet-worker', status: 'running', parentId: 'a-2', description: '' },
+  ]
+  const pins = [{ agentId: 'a-1', scope: ['be'], at: 1 }]
+  expect(writersOf(agents, pins)).toEqual([
+    { id: 'a-1', type: 'model-balance:opus-worker', scope: ['be'] },
+    { id: 'a-2', type: 'fork' },
+  ])
 })

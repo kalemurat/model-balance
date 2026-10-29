@@ -353,6 +353,92 @@ export const isInside = (path: string, directory: string): boolean => {
   return path === base || path.startsWith(`${base}/`) || path.startsWith(`${base}\\`)
 }
 
+/** Parallel parts of one task that may run at once, each a worker writing in its own scope. */
+export const MAX_PARALLEL_PARTS = 4
+
+const isAbsolute = (path: string): boolean => /^(?:[/\\]|[A-Za-z]:[/\\])/.test(path)
+
+/** `.` and `..` segments resolved and separators made `/`, so `be/../fe/x` cannot pass for a path inside `be`. */
+const normalizePath = (path: string): string => {
+  const parts: string[] = []
+  for (const part of path.split(/[/\\]+/)) {
+    const last = parts.at(-1)
+    if (part === '.') continue
+    if (part !== '..') parts.push(part)
+    // Above an absolute path's root there is nothing; a relative path keeps its leading `..`.
+    else if (last !== undefined && last !== '' && last !== '..') parts.pop()
+    else if (last !== '') parts.push(part)
+  }
+
+  return parts.join('/').replace(/(?<=.)\/+$/, '')
+}
+
+/** One entry of a `## Scope:` line: its first word unquoted, made relative to `root` when it lies inside it; '' for `root` itself. */
+const scopeEntry = (entry: string, root: string): string | undefined => {
+  const word = (entry.trim().replace(/^[-*•]\s*/, '').split(/\s+/)[0] ?? '').replace(/^[`'"]+|[`'"]+$/g, '')
+  if (word === '') return undefined
+  const base = normalizePath(root)
+  const path = normalizePath(word)
+
+  return isInside(path, base) ? path.slice(base.length).replace(/^\/+/, '') : path.replace(/^\/$/, '')
+}
+
+/** The heading a parallel part's brief names its directories under. */
+export const SCOPE_HEADING = /^\s*#{1,6}\s*Scope\b/im
+
+/**
+ * The directories a parallel part may write in, as its brief's `## Scope:` names them (comma-separated, on
+ * the heading's line or the lines under it), relative to `root`, the session's working directory; an
+ * absolute path outside it is kept as written. A brief that names none, or `root` itself, scopes the whole
+ * tree: `undefined`.
+ */
+export const readScope = (brief: string, root: string): string[] | undefined => {
+  const lines = brief.split('\n')
+  const start = lines.findIndex(line => SCOPE_HEADING.test(line))
+  if (start === -1) return undefined
+  const inline = lines[start]!.trim().replace(/^#{1,6}\s*Scope\b\s*:?/i, '')
+  const rest = lines.slice(start + 1)
+  const end = rest.findIndex(line => /^#{1,6}\s/.test(line.trim()))
+  const body = inline.trim() === '' ? (end === -1 ? rest : rest.slice(0, end)) : [inline]
+  const dirs = body.flatMap(line => line.split(',')).flatMap(entry => scopeEntry(entry, root) ?? [])
+  if (dirs.length === 0 || dirs.includes('')) return undefined
+
+  return [...new Set(dirs)]
+}
+
+/** Whether two writers can touch one file: `undefined`, the whole tree, overlaps every scope. */
+export const scopesOverlap = (a: readonly string[] | undefined, b: readonly string[] | undefined): boolean =>
+  a === undefined || b === undefined || a.some(one => b.some(other => isInside(one, other) || isInside(other, one)))
+
+/** Whether the absolute `path` lies in `scope`, its relative entries read from `root`. */
+export const isInScope = (path: string, scope: readonly string[], root: string): boolean => {
+  const target = normalizePath(path)
+  const base = normalizePath(root)
+
+  return scope.some(dir => isInside(target, normalizePath(isAbsolute(dir) ? dir : `${base}/${dir}`)))
+}
+
+/** `be/, fe/api/`: a scope as notes and the board name it. */
+export const scopeText = (scope: readonly string[]): string => scope.map(dir => `${dir}/`).join(', ')
+
+/** An agent that may be editing the working tree, with the scope its pin holds; none is the whole tree. */
+export type Writer = { id: string; type: string; scope?: string[] }
+
+/** Every top-level worker and fork whose run has not ended: the writers a new worker must not overlap. */
+export const writersOf = (agents: readonly WorkerCandidate[], pins: readonly Pin[]): Writer[] =>
+  agents
+    .filter(
+      agent =>
+        agent.parentId === undefined &&
+        isActiveStatus(agent.status) &&
+        (tierOfWorker(agent.type) !== undefined || agent.type === FORK_TYPE),
+    )
+    .map(agent => {
+      const scope = pinOf(pins, agent.id)?.scope
+
+      return { id: agent.id, type: agent.type, ...(scope === undefined ? {} : { scope }) }
+    })
+
 /** Matches any of `stems` as the start of a word; `\b` would miss stems opening with ö, ç, ğ. */
 const wordStarts = (stems: readonly string[]): RegExp =>
   new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.join('|')})`, 'iu')

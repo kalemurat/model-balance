@@ -24,6 +24,8 @@ export type AgentRow = {
   id: string
   type: string
   tier?: 'haiku' | 'sonnet' | 'opus'
+  /** The directories a parallel part writes in, relative to the session's working directory. */
+  scope?: string[]
   description: string
   status: 'running' | 'done' | 'failed' | 'stopped'
   startedAt: number
@@ -44,12 +46,17 @@ export type HandoffEffort = 'low' | 'medium' | 'high' | 'xhigh' | number
  * The model and effort every request of one agent runs at (turn.step), as the router chose them for it or
  * as the agent it continues ran. `model` absent leaves the agent on the model the engine resolved (a fork
  * on main's, whose prompt cache it then shares); `effort` absent, at its own effort.
+ *
+ * `scope` holds a parallel part to the directories its brief named (relative to the session's working
+ * directory): its file edits outside them are refused, and no other writer may start inside them while it
+ * runs. Absent, the agent's scope is the whole tree.
  */
 export type Pin = {
   agentId: string
   tier?: 'haiku' | 'sonnet' | 'opus'
   model?: string
   effort?: HandoffEffort
+  scope?: string[]
   at: number
 }
 
@@ -70,6 +77,7 @@ export type Handoff = {
   description: string
   model: string
   effort?: HandoffEffort
+  scope?: string[]
   tokens: number
   window: number
   at: number
@@ -79,6 +87,13 @@ export type Handoff = {
   continueAs?: string
   continuedBy?: string
 }
+
+/**
+ * One parallel part of the task the latest routing note started: the worker and the directories it writes
+ * in. On that turn main's own edits are refused inside the parts' scopes and allowed outside them, where
+ * main makes the shared changes the parts' reports ask for.
+ */
+export type Part = { agentId: string; scope: string[] }
 
 /** A finished worker's final report, kept for the workers after it: the session's record of what was done. */
 export type WorkerReport = {
@@ -98,6 +113,7 @@ declare module 'claude-code' {
       pins: Pin[]
       reports: WorkerReport[]
       handoffs: Handoff[]
+      parts: Part[]
       isHistoryOpen: boolean
       isPaneDismissed: boolean
     }

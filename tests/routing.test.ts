@@ -1,7 +1,7 @@
 import { expect, mock, test, type Engine } from 'claude-code/testing'
-import type { AgentInfo, AgentSpawnInput, On, PromptSubmitInput, TurnStepInput } from 'claude-code'
+import type { AgentInfo, AgentSpawnInput, On, PromptSubmitInput, SessionMessage, ToolCallResult, TurnStepInput } from 'claude-code'
 
-import { LEGACY_DEFAULT_KEY, NOTICE_OPEN, sessionToggleKey } from '../hooks/route'
+import { LEGACY_DEFAULT_KEY, MARK_CLOSE, MARK_OPEN, NOTICE_OPEN, sessionToggleKey } from '../hooks/route'
 import type { AgentRow, Pin } from '../types'
 
 const USAGE = { input_tokens: 300, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
@@ -34,7 +34,11 @@ const session = (on: On, options: { enabled?: boolean; reply?: string; mainToken
   const ids = { session: 's-1' }
   on('session.id', () => ({ value: ids.session }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
-  on('session.messages', () => ({ value: [] }))
+  // Main's transcript as the guards read it; a test adds the routed prompt when it needs one.
+  const messages: SessionMessage[] = []
+  on('session.messages', () => ({ value: messages }))
+  on('session.cwd', () => ({ value: '/work' }))
+  on('tool.call', () => ({ result: { stdout: 'ok' } }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 } } }) as never)
   on('session.surfaces', () => ({ value: ['terminal'] }))
   const agents: AgentInfo[] = []
@@ -89,6 +93,7 @@ const session = (on: On, options: { enabled?: boolean; reply?: string; mainToken
     world,
     ids,
     statuses,
+    messages,
     agents,
     rated,
     prompts,
@@ -306,4 +311,104 @@ test('a short follow-up tells the status line it stayed in main', async ($, on) 
   await prompt($, 'merge et')
   expect(world.rated).toHaveLength(0)
   expect(world.statuses.at(-1)).toBe('→ main (short prompt)')
+})
+
+const SPLIT_TASK = 'Add the invoice export endpoint and its download button in the app.'
+
+/** A brief of one parallel part, as main writes it under the routing note. */
+const partBrief = (request: string, scope: string): string =>
+  `## Request: ${request}\n## Scope: ${scope}\n## Contract: GET /invoices/export returns a CSV file.`
+
+/** Main's transcript once the router's note came with the person's prompt: the turn is routed. */
+const routedTurn = (world: ReturnType<typeof session>): void => {
+  world.messages.push({ role: 'user', text: `${SPLIT_TASK}\n\n${MARK_OPEN}\nrouting note\n${MARK_CLOSE}`, toolUses: [] })
+}
+
+test('a split task runs one scoped worker per part, each rated on its own brief, side by side', async ($, on) => {
+  const world = session(on, { reply: 'SONNET HIGH NEW' })
+  expect(noteOf(await prompt($, SPLIT_TASK))).toContain('## Scope:')
+
+  world.world.reply = 'OPUS HIGH'
+  await $.agent.spawn(spawnOf({ description: 'Export endpoint', prompt: partBrief('the endpoint', 'be/') }))
+  world.agents.push({ id: 'a-1', type: 'model-balance:opus-worker', status: 'running', description: 'Export endpoint' })
+  world.world.reply = 'HAIKU LOW'
+  await $.agent.spawn(spawnOf({ description: 'Download button', prompt: partBrief('the button', '`fe/` (the app)') }))
+
+  // The request is rated once, and each part again on its brief alone.
+  expect(world.rated).toHaveLength(3)
+  expect(world.rated[2]!.startsWith('Brief of the part to rate:')).toBe(true)
+  expect(world.spawns.map(one => [one.subagentType, one.model])).toEqual([
+    ['model-balance:opus-worker', 'opus'],
+    ['model-balance:haiku-worker', 'haiku'],
+  ])
+  expect((await step($, world, 'a-1')).effort).toBe('high')
+  expect((await step($, world, 'a-2')).effort).toBe('low')
+  expect(world.stored.get('parts')).toEqual([
+    { agentId: 'a-1', scope: ['be'] },
+    { agentId: 'a-2', scope: ['fe'] },
+  ])
+  expect(world.rows().find(row => row.id === 'a-2')?.scope).toEqual(['fe'])
+})
+
+test('a worker overlapping a running writer, or with no scope beside one, is refused; so is a fork on a routed turn', async ($, on) => {
+  const world = session(on)
+  await prompt($, SPLIT_TASK)
+  await $.agent.spawn(spawnOf({ prompt: partBrief('the endpoint', 'be/') }))
+  world.agents.push({ id: 'a-1', type: 'model-balance:sonnet-worker', status: 'running', description: 'Export endpoint' })
+
+  expect((await $.agent.spawn(spawnOf({ prompt: partBrief('the export job', 'be/jobs/') }))).deny).toContain('overlaps')
+  expect((await $.agent.spawn(spawnOf({ prompt: 'Fix the login form.' }))).deny).toContain('may write anywhere')
+  expect(world.spawns).toHaveLength(1)
+
+  routedTurn(world)
+  const fork = await $.agent.spawn(spawnOf({ subagentType: 'fork', fork: true, prompt: 'Do the fe/ side.' }))
+  expect(fork.deny).toContain('a fork is refused on this turn')
+  expect(world.spawns).toHaveLength(1)
+})
+
+test("a part edits only inside its scope; main, on the split turn, only outside every part's", async ($, on) => {
+  const world = session(on)
+  await prompt($, SPLIT_TASK)
+  routedTurn(world)
+  await $.agent.spawn(spawnOf({ prompt: partBrief('the endpoint', 'be/') }))
+  const edit = async (path: string, agentId?: string): Promise<ToolCallResult> =>
+    (await $.tool.call({ tool: 'Edit', file_path: path, old_string: 'a', new_string: 'b', ...(agentId === undefined ? {} : { agentId }) } as never)) as ToolCallResult
+
+  expect((await edit('/work/be/src/export.ts', 'a-1')).deny).toBeUndefined()
+  expect((await edit('/work/be/../fe/src/button.ts', 'a-1')).deny).toContain('outside it')
+  expect((await edit('/work/docs/api.md')).deny).toBeUndefined()
+  expect((await edit('/work/be/src/export.ts')).deny).toContain('scope of a parallel part')
+})
+
+test('a new task goes ahead beside scoped parts, and waits for a writer that may write anywhere', async ($, on) => {
+  const world = session(on, { reply: 'SONNET HIGH NEW' })
+  await prompt($, SPLIT_TASK)
+  await $.agent.spawn(spawnOf({ description: 'Export endpoint', prompt: partBrief('the endpoint', 'be/') }))
+  world.agents.push({ id: 'a-1', type: 'model-balance:sonnet-worker', status: 'running', description: 'Export endpoint' })
+
+  const beside = noteOf(await prompt($, 'Fix the typo in the README introduction paragraph.'))
+  expect(beside).toContain('rated this request SONNET')
+  expect(beside).toContain('Still running: sonnet worker a-1 in be/')
+
+  world.agents.push({ id: 'a-x', type: 'fork', status: 'running', description: 'look around' })
+  expect(noteOf(await prompt($, 'Fix the typo in the README introduction paragraph.'))).toContain('fork a-x is still running')
+})
+
+test('a follow-up to a split is judged against every part and sent to the ones it concerns', async ($, on) => {
+  const world = session(on, { reply: 'SONNET HIGH NEW' })
+  await prompt($, SPLIT_TASK)
+  world.world.reply = 'SONNET HIGH'
+  await $.agent.spawn(spawnOf({ description: 'Export endpoint', prompt: partBrief('the endpoint', 'be/') }))
+  await $.agent.spawn(spawnOf({ description: 'Download button', prompt: partBrief('the button', 'fe/') }))
+  world.agents.push(
+    { id: 'a-1', type: 'model-balance:sonnet-worker', status: 'completed', description: 'Export endpoint' },
+    { id: 'a-2', type: 'model-balance:sonnet-worker', status: 'completed', description: 'Download button' },
+  )
+
+  world.world.reply = 'SONNET MEDIUM CONTINUE'
+  const note = noteOf(await prompt($, 'The download button should also show a spinner while it waits.'))
+  expect(world.rated.at(-1)).toContain('Description: Export endpoint (in be/); Download button (in fe/)')
+  expect(note).toContain('continuation of the task these parallel parts did')
+  expect(note).toContain('sonnet worker a-1 in be/')
+  expect(note).toContain('sonnet worker a-2 in fe/')
 })

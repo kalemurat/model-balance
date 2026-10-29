@@ -1,5 +1,6 @@
 import { expect, mock, test, type Engine } from 'claude-code/testing'
 import type {
+  AgentInfo,
   AgentSpawnInput,
   On,
   PromptSubmitInput,
@@ -48,7 +49,10 @@ const session = (on: On, options: { enabled?: boolean } = {}) => {
   // No auto memory: the breakdown lists no memory file, so a worker goes without the index.
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 } } }) as never)
   on('session.surfaces', () => ({ value: ['terminal'] }))
-  on('agent.list', () => ({ value: [] }))
+  on('session.cwd', () => ({ value: '/work' }))
+  // The agents the engine lists as started; a test adds the ones whose run it needs listed.
+  const listed: AgentInfo[] = []
+  on('agent.list', () => ({ value: listed }))
 
   // The handoff request goes beside a tool result: a send would meet SendMessage's permission check.
   const sends: SessionSendInput[] = []
@@ -104,6 +108,7 @@ const session = (on: On, options: { enabled?: boolean } = {}) => {
   })
 
   return {
+    listed,
     tools,
     sends,
     spawns,
@@ -430,4 +435,23 @@ test('the board marks the agent asked to hand off', async ($, on) => {
   expect(row).toContain('ctx 66%')
   expect(row).toContain('handoff at 65%')
   await ui.unmount()
+})
+
+test('the agent continuing a parallel part keeps its scope and starts beside the other part', async ($, on) => {
+  const world = session(on)
+  await $.agent.spawn(spawnOf({ prompt: 'Migrate the store.\n## Scope: be/' }))
+  await $.agent.spawn(spawnOf({ prompt: 'Migrate the views.\n## Scope: fe/', description: 'Migrate the views' }))
+  world.listed.push({ id: 'a-2', type: OPUS, status: 'running', description: 'Migrate the views' })
+  world.answer.tokens = 660_000
+  await step($, 'a-1')
+  await complete($, 'a-1', REPORT)
+  expect(world.handoffs()[0]).toMatchObject({ status: 'reported', scope: ['be'] })
+
+  await notify($, 'a-1')
+  const started = await $.agent.spawn(
+    spawnOf({ prompt: `Carry on with the store migration.\n${continuesLine('a-1')}`, description: 'Migrate the store (cont.)' }),
+  )
+  // The fe/ part still runs; the be/ continuation stays out of its scope, so it starts.
+  expect(started.agentId).toBe('a-3')
+  expect(world.agents().find(row => row.id === 'a-3')?.scope).toEqual(['be'])
 })

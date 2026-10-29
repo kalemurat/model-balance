@@ -18,6 +18,7 @@ A Claude Code plugin that spends fewer tokens on the same work. A router rates e
 - **Rates `/subtask` and forks too.** A `/subtask` you start and a fork the main model starts on its own are rated the same way.
   - Their effort is pinned to the rated one. A fork keeps sharing its prompt cache with the main conversation at any effort.
   - Their model changes only where the change pays for itself: up to a stronger model when the task needs it, and down to a cheaper one only while the main conversation holds at most 50k tokens. A new model has to write the whole conversation to its own cache again.
+- **Runs parallel parts side by side.** When the project's instructions or the request split a task into parallel parts in separate directories (a `be/` and an `fe/`, say, even where the instructions call the parts forks), the main model starts one worker per part instead, at most four, each brief naming its directories under `## Scope` and, where the parts depend on each other, a shared `## Contract`. See [Parallel parts](#parallel-parts).
 - **Refuses main's own file edits on a routed turn.** `Edit`, `Write` and `NotebookEdit` are denied on a routed turn so that the worker does the work.
 - **Lets workers ask blocking questions.** A worker or a fork can call `mcp__model-balance__ask_user`. It opens one AskUserQuestion dialog with up to four questions and returns the answers.
 - **Shows a board of the subagents.**
@@ -50,9 +51,27 @@ A Claude Code plugin that spends fewer tokens on the same work. A router rates e
 
 **Small changes.** A change of one or two tool calls costs more routed while the main conversation is small. That is why the router keeps those in main below 150k tokens.
 
+**Parallel parts.** The setup was a task that touches a `be/` and an `fe/` project, from a 74k-token main conversation on Opus, with project instructions that ask for two parallel forks, on Claude Code 2.1.312. One run per arm:
+- Without routing, the main model started two forks. Each began at 88k tokens and ran on Opus: 1.18M tokens read from the cache across both. The session cost $1.78.
+- With routing, it started two scoped workers. Each began at 22k tokens and ran on Sonnet, as its own rating picked: 202k tokens read from the cache. The session cost $1.41, 21% less, plus three router calls of about 1.5k input tokens each.
+- Both arms finished the task, and both sides' tests passed.
+
 **Forks.** A fork reads the main conversation from the prompt cache only while it stays on the main model; its effort can change without losing that. Routed tasks go to fresh workers, not forks: a fork would re-read the whole main conversation on every request.
 
 **The router's own cost.** The router call costs about 1.5k input tokens per routed prompt. Claude Code leaves a plugin's model calls out of the session's cost total.
+
+## Parallel parts
+
+A task the project's instructions or the request split into parallel parts in separate directories runs as one worker per part, side by side.
+
+- **The split.** The routing note asks the main model to call the Agent tool once per part, at most four, in one message. Each brief adds `## Scope: <directories>`, relative to the working directory, and, where the parts depend on each other, the same `## Contract`. The main model writes the contract from the conversation. If settling it needs code read, the part the others depend on starts first, and the rest start from its report.
+- **Each part's model and effort.** The router rates each part again on its brief alone, so a `be/` part can run on Opus while an `fe/` part runs on Haiku.
+- **Who may run at once.** Running top-level workers and forks are writers. A worker starts only if its scope overlaps no running writer's. A writer with no scope may write anywhere, so nothing starts beside it, and a new task waits for it. Beside scoped parts, a new task goes ahead in a scope of its own.
+- **Forks.** On a routed turn a fork the main model starts is refused, since it would carry the whole conversation into each of its requests. A `/subtask` you start, and a fork on a turn the router left to the main model, run as Claude Code starts them.
+- **Edits.** A part's `Edit`, `Write` and `NotebookEdit` outside its scope are refused, and it lists the changes it needs there in its report. On that turn the main model may edit outside every part's scope, the shared files, and not inside one.
+- **Follow-ups.** The router judges a follow-up against all the parts as one task. The continuation note lists them with their scopes, and the main model sends the request to the parts it concerns.
+- **Handoffs.** An agent that continues a part's handoff keeps its scope, so it starts while the other parts still run.
+- **The board** shows each part's scope on its row.
 
 ## Context handoff
 
@@ -87,6 +106,7 @@ Everything the plugin does goes through Claude Code's own engine API; it opens n
     - The main conversation's token count, while that count is under 150k.
     - When a worker exists, the first 1,500 characters of that worker's brief.
   - **`/subtask` and forks.** A `/subtask`, or a fork the main model starts, gets one such request too, over its task text and the same excerpt.
+  - **Parallel parts.** Each part of a split task gets one such request too, over the part's brief alone.
 - **Worker input.** Each worker is a subagent started through the Agent tool. Its prompt carries, in this order:
   1. The first 200 lines or 25 KB of the auto-memory `MEMORY.md`.
   2. The latest messages of the main conversation: up to 12 messages, 1,500 characters for the user's and 700 for the main model's, 14,000 in total, tool results excluded.
@@ -109,15 +129,15 @@ The plugin is a mod: a hooks module that registers on engine events. This is eve
 | Hook | What it does |
 | --- | --- |
 | `session.start` | Registers the three worker agent types (`model-balance:haiku-worker`, `sonnet-worker`, `opus-worker`) with their models and effort levels, the `mcp__model-balance__ask_user` tool and the `/model-balance` command. Deletes the default for new sessions an earlier version stored. |
-| `classic.SessionStart` for `clear`, `resume` and `fork` | A `/clear` (`/new`) or `/resume` moves the process to another session without a `session.start`. Takes the new session's own on/off (off unless a resumed session was switched on) and shows it on the status line. For `clear` and `resume`, also empties the board, the workers' reports and the handoffs of the conversation that ended. |
+| `classic.SessionStart` for `clear`, `resume` and `fork` | A `/clear` (`/new`) or `/resume` moves the process to another session without a `session.start`. Takes the new session's own on/off (off unless a resumed session was switched on) and shows it on the status line. For `clear` and `resume`, also empties the board, the workers' reports, the handoffs and the parallel parts of the conversation that ended. |
 | `command.run` for `/model-balance` | Answers the command itself: switches routing for this session, opens or closes the board's pane, or prints the status or context report. |
 | `command.run` for `/subtask` | While routing is on, rates the task. Appends the agent note after the task's text, so the fork keeps the name Claude Code takes from the task's first words. Holds the model and effort for the fork's first turn. |
-| `prompt.submit` | On a human-typed prompt while routing is on: strips a `#tier` prefix and, unless the router answers MAIN, attaches a routing note to the model's context. On a background agent's notification that carries a handoff: attaches the continuation note. Otherwise the prompt text is passed on as typed; nothing is dropped. |
-| `agent.spawn` | **Worker types:** adds the earlier workers' reports, the latest messages and the memory index to the main model's brief, sets the model to the tier's alias and holds the effort the router picked. Refuses a second top-level worker while one is still running. **While routing is on:** rates and pins a fork the main model starts, and gives every other spawn the agent note. **Continuations:** a spawn that continues a handoff runs as the agent type the note named and on the previous agent's model, with the handoff report ahead of the brief. **Every spawn** goes on the board; with routing off, spawns of other agent types pass through unchanged. |
+| `prompt.submit` | On a human-typed prompt while routing is on: strips a `#tier` prefix and, unless the router answers MAIN, attaches a routing note to the model's context. The note names the scoped parts still running, beside which a new task may start in a scope of its own. On a background agent's notification that carries a handoff: attaches the continuation note. Otherwise the prompt text is passed on as typed; nothing is dropped. |
+| `agent.spawn` | **Worker types:** adds the earlier workers' reports, the latest messages and the memory index to the main model's brief, sets the model to the tier's alias and holds the effort the router picked. Refuses a worker whose scope overlaps a running worker's or fork's; a worker with no `## Scope` has the whole tree. **Parallel parts:** rates a scoped worker on its brief and switches it to that tier's worker type, model and effort. **While routing is on:** refuses a fork the main model starts on a routed turn, rates and pins one it starts on another turn, and gives every other spawn the agent note. **Continuations:** a spawn that continues a handoff runs as the agent type the note named and on the previous agent's model, with the handoff report ahead of the brief. **Every spawn** goes on the board; with routing off, spawns of other agent types pass through unchanged. |
 | `session.compact` for the `auto` and `precompute` triggers | While routing is on, skips the compaction, in the main conversation and in subagents. `/compact` and a plugin's compaction pass through. |
 | `tool.call` for `Agent` | When a foreground subagent's result is a handoff, attaches the continuation note beside the result. Every other Agent call passes through unchanged. |
 | `tool.call` for every tool | Attaches the handoff request to the next tool result of a subagent marked to hand off. Every other call passes through unchanged. |
-| `tool.call` for `Edit`, `Write`, `NotebookEdit` | Refuses these to the main conversation on a routed turn, except inside the auto-memory directory, so the worker does the editing. The user bypasses this with `#main`. Subagents' calls pass through unchanged. |
+| `tool.call` for `Edit`, `Write`, `NotebookEdit` | Refuses these to the main conversation on a routed turn, except inside the auto-memory directory and, once the work is split, outside every part's scope, so the workers do the editing. The user bypasses this with `#main`. Refuses a parallel part's edits outside its own scope; other subagents' calls pass through unchanged. |
 | `tool.call` for `mcp__model-balance__ask_user` | Implements the plugin's own tool. When a worker or a fork calls it, the plugin calls `AskUserQuestion` on its behalf (subagents cannot call it themselves), waits for the dialog and returns the answers as the tool result. This is the only tool the plugin calls itself, and only in answer to an agent's call. |
 | `turn.start` | Starts a subagent's clock on the board, again when SendMessage resumes it. Gives a new agent the model and effort held for it. Puts a `/subtask`'s fork on the board. |
 | `turn.step` | Runs every subagent request on the model and at the effort pinned for it: the router's choice, or the previous agent's for a continuation. Lowers `max` to `xhigh` whoever asked for it. Records each subagent's context fill, model and effort for the board. Marks a subagent past 65% to hand off while routing is on. The main conversation's requests pass unchanged; their model and effort go on main's row of the board. |
@@ -228,6 +248,8 @@ Five options appear as rows in `/config` (and in the plugin's configuration dial
 - **The `xhigh` ceiling holds for every subagent** of the session, not only this plugin's workers.
 - **An unasked pane may wait.** A pane opened without being asked waits in a narrow window; `/model-balance panel` opens it at any width.
 - **Compaction for over-long prompts is skipped too.** With auto-compaction off, the engine's compaction of a prompt grown too long for its window is skipped. The conversation stays as it is, with a line saying why, until you run `/compact` or `/model-balance off`. The same holds for a subagent that reaches its limit before it hands off.
+- **A part's scope covers file edits only.** `Bash` can still write outside it; the brief and the worker's instructions keep a part inside its directories.
+- **A running fork holds new work back.** A fork has no scope, so while one runs (a `/subtask` included), a new routed task waits and no worker starts.
 - **The handoff point is fixed.** It is 65% of the window, measured against the documented model table, as the board's figures are.
 - **A handoff depends on the subagent and the main model.**
   - The subagent has to follow the note.

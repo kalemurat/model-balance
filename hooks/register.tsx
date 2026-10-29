@@ -10,6 +10,8 @@ import {
   LEGACY_DEFAULT_KEY,
   MARK_CLOSE,
   MARK_OPEN,
+  MAX_PARALLEL_PARTS,
+  SCOPE_HEADING,
   TIERS,
   agentLabel,
   agentNotice,
@@ -40,6 +42,7 @@ import {
   handoffsNamedIn,
   isActiveStatus,
   isContinuationReply,
+  isInScope,
   isInside,
   isPastHandoffPoint,
   isRoutedTurn,
@@ -66,10 +69,13 @@ import {
   readRouterEffort,
   readRouterModel,
   readSavedToggle,
+  readScope,
   readToggleCommand,
   readWorkerEffort,
   restartAgent,
   routerChain,
+  scopeText,
+  scopesOverlap,
   sessionToggleKey,
   shortModelName,
   subagentEffortOf,
@@ -77,6 +83,7 @@ import {
   undeliveredHandoffOf,
   upsertAgent,
   workerType,
+  writersOf,
   type ContextLine,
   type Provider,
   type Route,
@@ -88,8 +95,9 @@ import {
   type WindowEnv,
   type WorkerCandidate,
   type WorkerEffort,
+  type Writer,
 } from './route'
-import type { AgentRow, Handoff, MainContext, Pin, SessionToggle } from '../types'
+import type { AgentRow, Handoff, MainContext, Part, Pin, SessionToggle } from '../types'
 
 const ASK_TOOL_NAME = `mcp__model-balance__${ASK_TOOL}` as const
 
@@ -115,8 +123,11 @@ type RoutedSpawn = { tier: Tier; effort?: SubagentEffort; by: string }
 /** A pin waiting for its agent's first turn, which names the agent by the prompt it starts with. */
 type PendingPin = { text: string; pin: PinSpec; at: number }
 
-/** The latest top-level worker as the router reads it for a follow-up. */
-type LastWorker = { id: string; tier: Tier; description: string; task: string; isActive: boolean }
+/**
+ * A top-level worker as the router reads it for a follow-up; `scope` is set for a parallel part. The last
+ * task is one worker, or every part of the task the latest split started.
+ */
+type LastWorker = { id: string; tier: Tier; description: string; task: string; isActive: boolean; scope?: string[] }
 
 /** Prompts a person sent; notifications, peers, schedules and other plugins pass untouched. */
 const ROUTED_ORIGINS = new Set(['composer', 'bridge', 'sdk'])
@@ -164,6 +175,11 @@ ${LEVELS}
 ${EFFORTS}
 Answer with exactly two words, the level and the effort, e.g. "SONNET HIGH".`
 
+const PART_CLASSIFIER_SYSTEM = `You rate one part of a task in a coding-assistant session: a fresh agent does it from the brief below, which is all it sees of the conversation, alongside agents doing the other parts in other directories. Pick the cheapest model that will do this part well:
+${LEVELS}
+${EFFORTS}
+Answer with exactly two words, the level and the effort, e.g. "SONNET HIGH".`
+
 const HANDOFF_RULE = `A note that opens with "${MARK_OPEN} Context handoff" may follow one of your tool results once your context window fills past ${Math.round(HANDOFF_RATIO * 100)}%. It comes from the model-balance router on the user's behalf, not from the tool's output: follow it as soon as it arrives. It overrides the report format below.`
 
 const ASK_RULES = `When the work needs a decision only the user can make (a choice between approaches, a missing fact, an ambiguity the request, the code and the docs do not settle), ask it with the ${ASK_TOOL_NAME} tool: it opens the user's own AskUserQuestion dialog, waits for the answers and returns them, and you carry on with the task using them. Ask only what blocks the work, gather related questions into one call (up to 4), and never answer in the user's place. Do not end your run with a question in your final message expecting a reply: nobody replies to it. If the tool reports a question left unanswered, stop and list it under "Open" in your report. If something else blocks you, stop and say what.`
@@ -190,46 +206,87 @@ ${HANDOFF_RULE}
 
 Before you start, open with Read the memory files whose line touches your task, every feedback_ one among them, and follow them as the main conversation would. Leave writing memory to the main conversation.
 
-Do the task completely with the tools you have, following the project's instructions.
+Do the task completely with the tools you have, following the project's instructions. When your handoff has a "## Scope", you are one of several agents working in parallel, each in its own directories: Edit, Write and NotebookEdit outside yours are refused, so list each change you need there under "Open" for the main conversation to make.
 
 ${ASK_RULES}
 
 ${REPORT_RULES}`
 
-const NO_EDITS = 'Edit, Write and NotebookEdit are refused to you on this turn, outside the auto-memory directory.'
+const NO_EDITS =
+  "Edit, Write and NotebookEdit are refused to you on this turn, except in the auto-memory directory and, once the work is split, outside every part's scope."
+
+/**
+ * How main splits a routed task the project's instructions or the request divide into parallel parts: one
+ * scoped worker per part, each rated on its own, never a fork, which would carry main's whole context.
+ */
+const SPLIT_RULE = `Where the project's instructions or the request split this work into parallel parts in separate directories (forks included), instead call the Agent tool once per part (at most ${MAX_PARALLEL_PARTS}, in one message) with this subagent_type, each brief adding "## Scope: <its directories, relative to the working directory>" and, if the parts depend on each other, the same "## Contract: <shared interfaces and data shapes>"; if the contract needs code read, start the part the others depend on first. Each part is rated on its own; forks are refused. Wait for every part, make the changes they list outside their scopes, and answer once.`
 
 const workerFollowUp = `The agent asks the user its own questions through a dialog while it runs. If its report still ends with open questions for the user, do not answer them yourself and do not stop there: ask them with AskUserQuestion, then continue that same agent with SendMessage (its agent id or name; load SendMessage through ToolSearch if it is deferred), passing the answers verbatim, and wait for its new report.
 When the agent returns, answer the user from its report: relay its result, its changes and what is left open, faithfully and briefly. The report is the record: do not re-run its checks, re-read the files it changed or redo any of its work yourself, as every request of yours re-reads this whole conversation. What it left unverified or failed goes back to it with SendMessage, or to the user as open.
 A report that ends with ${HANDOFF_CONTINUE} is a handoff, not a result: its agent stopped because its context filled, and the task goes on. Follow the routing note that comes with it; without one, call the Agent tool at once with the same subagent_type and a prompt that restates your brief and holds the line "${continuesLine('<its agent id>')}", and pass no model or effort: the router attaches the report and keeps the model and effort.`
 
-const workerLabel = ({ id, tier, description }: LastWorker): string =>
-  `${tier} worker ${id}${description === '' ? '' : ` ("${description}")`}`
+const workerLabel = ({ id, tier, description, scope }: LastWorker): string =>
+  `${tier} worker ${id}${scope === undefined ? '' : ` in ${scopeText(scope)}`}${description === '' ? '' : ` ("${description}")`}`
+
+/** A writer as a note names it: a worker by its tier, a fork as a fork, with the directories it writes in. */
+const writerLabel = ({ id, type, scope }: Writer): string =>
+  `${type === FORK_TYPE ? 'fork' : `${tierOfWorker(type) ?? type} worker`} ${id}${scope === undefined ? '' : ` in ${scopeText(scope)}`}`
 
 const routedPin = ({ tier, effort }: RoutedSpawn): PinSpec => ({ tier, model: tier, ...(effort === undefined ? {} : { effort }) })
 
 const ratedText = (spawn: RoutedSpawn): string =>
   `${spawn.tier.toUpperCase()}${spawn.effort === undefined ? '' : ` at effort ${spawn.effort.toUpperCase()}`} (${spawn.by})`
 
-const spawnNote = (spawn: RoutedSpawn): string => `${MARK_OPEN}
-The model-balance router rated this request ${ratedText(spawn)}.
+const FORK_REFUSED =
+  'model-balance routed this request to workers, so a fork is refused on this turn: it would carry this whole conversation into each of its requests. Follow the routing note: brief a worker, one per part with a "## Scope" where the work splits into parallel parts.'
+
+/** Why a worker with `scope` may not start beside `writers`; `undefined` when it may. */
+const writerRefusal = (writers: readonly Writer[], scope: readonly string[] | undefined): string | undefined => {
+  const blocking = writers.find(writer => scopesOverlap(writer.scope, scope))
+  if (blocking !== undefined && blocking.scope !== undefined && scope !== undefined) {
+    return `The ${writerLabel(blocking)} is still running, and its scope overlaps this part's (${scopeText(scope)}). Give the part a scope outside it, or tell the user it waits until that agent finishes.`
+  }
+  if (blocking !== undefined) {
+    return `The ${writerLabel(blocking)} is still running, and two agents that may write in the same files must not run at once${scope === undefined ? ' (a worker with no "## Scope" in its brief may write anywhere)' : ''}. Tell the user this request waits until it finishes, or continue that worker with SendMessage if the request belongs to its task.`
+  }
+  if (scope !== undefined && writers.filter(writer => writer.scope !== undefined).length >= MAX_PARALLEL_PARTS) {
+    return `${MAX_PARALLEL_PARTS} parallel parts are running already, the most that run at once. Start this part when one of them finishes.`
+  }
+
+  return undefined
+}
+
+/** `running` lists the scoped parts still at work, which a new worker's scope must stay out of. */
+const spawnNote = (spawn: RoutedSpawn, running: readonly Writer[]): string => `${MARK_OPEN}
+The model-balance router rated this request ${ratedText(spawn)}.${running.length === 0 ? '' : ` Still running: ${running.map(writerLabel).join('; ')}. A worker is refused unless its brief's "## Scope" stays out of theirs; if this task needs their directories, tell the user it waits until they finish.`}
 Do not do the work yourself and do not read files first. ${NO_EDITS} Call the Agent tool once with subagent_type "${workerType(spawn.tier)}", a short description, and a prompt that briefs a colleague who has not seen this conversation, under these headings:
 ## Request: the user's request in full, in their own words where the wording matters.
 ## Context: what this conversation has settled that bears on it: decisions, constraints, the user's preferences and corrections, what was tried and failed, earlier results it builds on.
 ## Pointers: files, routes, symbols, commands or URLs already known.
 ## Done when: what the user will check.
 Write it from the whole conversation, a summary of earlier parts included, and leave out what does not bear on the task. The router adds the earlier workers' reports, the latest messages verbatim and the memory index itself, so do not paste those. Pass no model or effort: the router runs the worker on ${pinText(routedPin(spawn))}.
+${SPLIT_RULE}
 ${workerFollowUp} Only if the worker failed or the report shows the task is clearly not ${spawn.tier}-level may you retry once with another model-balance worker type.
 ${MARK_CLOSE}`
 
-const continueNote = (worker: LastWorker, by: string): string => `${MARK_OPEN}
-The model-balance router judged this request a continuation of the task the ${workerLabel(worker)} ${worker.isActive ? 'is doing' : 'did'} (${by}).
-Do not do the work yourself and do not spawn a new worker. ${NO_EDITS} Send the request to that worker with SendMessage (to: "${worker.id}"; load SendMessage through ToolSearch if it is deferred): the user's words, with every detail it needs, and what changed in this conversation since its last report (decisions, answers, other work done). ${worker.isActive ? 'It is still running and takes the message as a course correction.' : 'It resumes with its full history, on the same model and effort.'}
+const continueNote = (workers: readonly LastWorker[], by: string): string => {
+  const [first] = workers
+  const isSplit = workers.length > 1
+  const target = isSplit
+    ? `the worker or workers whose part it concerns (SendMessage to their agent id; load SendMessage through ToolSearch if it is deferred): ${workers.map(workerLabel).join('; ')}`
+    : `that worker with SendMessage (to: "${first!.id}"; load SendMessage through ToolSearch if it is deferred)`
+
+  return `${MARK_OPEN}
+The model-balance router judged this request a continuation of the task ${isSplit ? 'these parallel parts' : `the ${workerLabel(first!)}`} ${workers.some(one => one.isActive) ? 'are doing' : 'did'} (${by}).
+Do not do the work yourself and do not spawn a new worker. ${NO_EDITS} Send the request to ${target}: the user's words, with every detail it needs, and what changed in this conversation since its last report (decisions, answers, other work done). A worker still running takes the message as a course correction; a finished one resumes with its full history, on the same model and effort.
 ${workerFollowUp}
 ${MARK_CLOSE}`
+}
 
-const waitNote = (worker: LastWorker): string => `${MARK_OPEN}
-The ${workerLabel(worker)} is still running, and the model-balance router judged this request a new task. Two workers must not edit the same working tree at once.
-Do not do the work yourself and do not spawn a worker: the spawn is refused. ${NO_EDITS} Tell the user in one or two sentences that this request waits until that worker finishes: they can send it again then, or prefix it with #main to have the main conversation do it now.
+/** `writer` holds no scope, so it may write anywhere: nothing else may start beside it. */
+const waitNote = (writer: Writer): string => `${MARK_OPEN}
+The ${writerLabel(writer)} is still running, and the model-balance router judged this request a new task. Two agents must not edit the same working tree at once.
+Do not do the work yourself and do not spawn a worker: the spawn is refused. ${NO_EDITS} Tell the user in one or two sentences that this request waits until that agent finishes: they can send it again then, or prefix it with #main to have the main conversation do it now.
 ${MARK_CLOSE}`
 
 const toggleRef = { plugin: 'model-balance', key: 'toggle' } as const
@@ -239,6 +296,7 @@ const agentsAtom = atom({ plugin: 'model-balance', key: 'agents' } as const, [])
 const pinsAtom = atom({ plugin: 'model-balance', key: 'pins' } as const, [])
 const reportsAtom = atom({ plugin: 'model-balance', key: 'reports' } as const, [])
 const handoffsAtom = atom({ plugin: 'model-balance', key: 'handoffs' } as const, [])
+const partsAtom = atom({ plugin: 'model-balance', key: 'parts' } as const, [])
 const historyOpenAtom = atom({ plugin: 'model-balance', key: 'isHistoryOpen' } as const, false)
 const paneDismissedAtom = atom({ plugin: 'model-balance', key: 'isPaneDismissed' } as const, false)
 
@@ -416,8 +474,19 @@ const noteMainRequest = async ($: EngineInterface, model: string, effort: ModelE
   })
 }
 
-const lastWorkerBlock = (worker: LastWorker): string =>
-  `<last_worker status="${worker.isActive ? 'running' : 'finished'}">\nDescription: ${worker.description}\nTask: ${worker.task.slice(0, LAST_TASK_CHARS)}\n</last_worker>\n\n`
+/** The last task as the router reads it: one worker, or every part of a split as one task. */
+const lastWorkerBlock = (workers: readonly LastWorker[]): string => {
+  const status = workers.some(one => one.isActive) ? 'running' : 'finished'
+  const description = workers
+    .map(one => (one.scope === undefined ? one.description : `${one.description} (in ${scopeText(one.scope)})`))
+    .join('; ')
+  const task = workers
+    .map(one => one.task)
+    .filter(one => one !== '')
+    .join('\n\n')
+
+  return `<last_worker status="${status}">\nDescription: ${description}\nTask: ${task.slice(0, LAST_TASK_CHARS)}\n</last_worker>\n\n`
+}
 
 /** The latest messages of main the router reads beside a request, '' before there are any. */
 const recentForRouter = async ($: EngineInterface): Promise<string> => {
@@ -460,7 +529,7 @@ async function askRouter<V>(
  * Rates the request with the router: where it goes, at which effort, and whether it continues the last
  * worker's task. Without a verdict the heuristic rates difficulty alone and never assumes a follow-up.
  */
-async function classify($: EngineInterface, text: string, last: LastWorker | undefined, router: Router): Promise<Verdict> {
+async function classify($: EngineInterface, text: string, last: readonly LastWorker[] | undefined, router: Router): Promise<Verdict> {
   const mainTokens = (await read($, mainContextAtom))?.tokens
   const small =
     mainTokens === undefined || mainTokens >= SMALL_TASK_MAIN_TOKENS
@@ -484,10 +553,22 @@ async function classify($: EngineInterface, text: string, last: LastWorker | und
     : { ...rated.value, by: rated.by }
 }
 
-/** Rates a task an agent that sees the conversation is about to do (a fork, a /subtask): its tier and effort. */
-async function rateTask($: EngineInterface, task: string, router: Router): Promise<{ tier: Tier; effort?: SubagentEffort; by: string }> {
-  const prompt = `${await recentForRouter($)}Task to rate:\n${task.slice(0, 6000)}`
-  const rated = await askRouter($, { system: TASK_CLASSIFIER_SYSTEM, prompt }, router, reply => {
+/**
+ * Rates a task an agent is about to do: its tier and effort. A fork or a /subtask sees the conversation, so
+ * the router reads its latest messages beside the task; a parallel part sees only its brief, and so does the
+ * router.
+ */
+async function rateTask(
+  $: EngineInterface,
+  task: string,
+  router: Router,
+  kind: 'fork' | 'part' = 'fork',
+): Promise<{ tier: Tier; effort?: SubagentEffort; by: string }> {
+  const request =
+    kind === 'part'
+      ? { system: PART_CLASSIFIER_SYSTEM, prompt: `Brief of the part to rate:\n${task.slice(0, 6000)}` }
+      : { system: TASK_CLASSIFIER_SYSTEM, prompt: `${await recentForRouter($)}Task to rate:\n${task.slice(0, 6000)}` }
+  const rated = await askRouter($, request, router, reply => {
     const route = parseVerdict(reply)
     if (route === undefined || route === 'main') return undefined
     const effort = parseEffort(reply)
@@ -517,16 +598,43 @@ const readMemoryIndex = async ($: EngineInterface): Promise<{ path: string; text
 }
 
 /** `task` is the worker's handoff as spawned, '' when this module did not see the spawn (a reload since). */
-const toLastWorker = (agent: WorkerCandidate, task: string | undefined): LastWorker | undefined => {
+const toLastWorker = (agent: WorkerCandidate, task: string | undefined, scope?: string[]): LastWorker | undefined => {
   const tier = tierOfWorker(agent.type)
 
   return tier === undefined
     ? undefined
-    : { id: agent.id, tier, description: agent.description, task: task ?? '', isActive: isActiveStatus(agent.status) }
+    : {
+        id: agent.id,
+        tier,
+        description: agent.description,
+        task: task ?? '',
+        isActive: isActiveStatus(agent.status),
+        ...(scope === undefined ? {} : { scope }),
+      }
 }
 
-const isTopLevelWorker = (agent: WorkerCandidate): boolean =>
-  tierOfWorker(agent.type) !== undefined && agent.parentId === undefined
+/**
+ * The last task the router judges a follow-up against: the latest worker, and the other parts of its split
+ * when it is one of the parts the latest routing note started. A part the person stopped is left out.
+ */
+const lastTaskOf = (
+  lastAgent: WorkerCandidate,
+  agents: readonly WorkerCandidate[],
+  parts: readonly Part[],
+  pins: readonly Pin[],
+  tasks: ReadonlyMap<string, string>,
+): LastWorker[] | undefined => {
+  const ids = parts.some(part => part.agentId === lastAgent.id) ? parts.map(part => part.agentId) : [lastAgent.id]
+  const workers = ids.flatMap(id => {
+    const agent = agents.find(one => one.id === id)
+    const worker =
+      agent === undefined || agent.status === 'killed' ? undefined : toLastWorker(agent, tasks.get(id), pinOf(pins, id)?.scope)
+
+    return worker === undefined ? [] : [worker]
+  })
+
+  return workers.length === 0 ? undefined : workers
+}
 
 /** Falls back to the agent list: a worker's first request can come before its spawn resolved. */
 async function workerTier(
@@ -569,6 +677,7 @@ async function trackSpawn($: EngineInterface, e: AgentSpawnInput, started: Agent
         id: agentId,
         type: e.subagentType,
         ...(tier === undefined ? {} : { tier }),
+        ...(pin?.scope === undefined ? {} : { scope: pin.scope }),
         description: known?.description ?? e.description,
         status: 'running',
         startedAt: now,
@@ -593,9 +702,9 @@ async function trackSpawn($: EngineInterface, e: AgentSpawnInput, started: Agent
 async function requestHandoff(
   $: EngineInterface,
   row: AgentRow,
-  request: { tokens: number; window: number; model: string; effort: Handoff['effort'] },
+  request: { tokens: number; window: number; model: string; effort: Handoff['effort']; scope: string[] | undefined },
 ): Promise<void> {
-  const { tokens, window, model, effort } = request
+  const { tokens, window, model, effort, scope } = request
   const record: Handoff = {
     agentId: row.id,
     type: row.type,
@@ -603,6 +712,8 @@ async function requestHandoff(
     description: row.description,
     model,
     ...(effort === undefined ? {} : { effort }),
+    // The agent continuing a parallel part keeps to its directories.
+    ...(scope === undefined ? {} : { scope }),
     tokens,
     window,
     at: await $.clock.now(),
@@ -662,6 +773,7 @@ const drawBoard = (
     const mark = STATUS_MARK[row.status]
     const percent = row.contextTokens === undefined ? undefined : percentOf(row.contextTokens, row.window)
     const tail = [
+      row.scope === undefined ? '' : ` · ${scopeText(row.scope)}`,
       row.outputTokens === undefined || row.status === 'running' ? '' : ` · out ${formatTokens(row.outputTokens)}`,
       row.effort === undefined ? '' : ` · effort ${row.effort}`,
       row.handoffAt === undefined ? '' : ` · handoff at ${row.handoffAt}%`,
@@ -747,6 +859,14 @@ export const register: Register = (on, options) => {
   let routed: RoutedSpawn | undefined
   /** Pins of agents spawned and not started yet: a fork's first request can come before its spawn resolves. */
   const pending: PendingPin[] = []
+  /** The tail of the worker spawns in progress: each waits for the one before it to check the writers and leave its pin. */
+  let spawning: Promise<unknown> = Promise.resolve()
+  const oneAtATime = <T,>(run: () => Promise<T>): Promise<T> => {
+    const result = spawning.then(run, run)
+    spawning = result.catch(() => undefined)
+
+    return result
+  }
 
   on('session.start', async ($, e, next) => {
     for (const tier of TIERS) {
@@ -819,6 +939,7 @@ export const register: Register = (on, options) => {
     await update($, agentsAtom, () => [])
     await update($, reportsAtom, () => [])
     await update($, handoffsAtom, () => [])
+    await update($, partsAtom, () => [])
     await update($, historyOpenAtom, () => false)
     await update($, paneDismissedAtom, () => false)
     await measureMain($)
@@ -916,12 +1037,12 @@ export const register: Register = (on, options) => {
 
     const text = override === undefined ? e.text : rest
     const agents = await $.agent.list()
+    const pins = await read($, pinsAtom)
     // Only a worker of this conversation is continued: its board is emptied with the conversation (/clear, /resume).
     const onBoard = new Set((await read($, agentsAtom)).map(row => row.id))
     const lastAgent = pickLastWorker(agents.filter(agent => onBoard.has(agent.id)), lastWorkerId)
-    const last = lastAgent === undefined ? undefined : toLastWorker(lastAgent, workerTasks.get(lastAgent.id))
-    const runningAgent = agents.find(agent => isTopLevelWorker(agent) && isActiveStatus(agent.status))
-    const running = runningAgent === undefined ? undefined : toLastWorker(runningAgent, workerTasks.get(runningAgent.id))
+    const last = lastAgent === undefined ? undefined : lastTaskOf(lastAgent, agents, await read($, partsAtom), pins, workerTasks)
+    const writers = writersOf(agents, pins)
     // An explicit #tier asks for a fresh worker, so only the classifier's own verdict continues one.
     const verdict: Verdict =
       override === undefined
@@ -936,22 +1057,25 @@ export const register: Register = (on, options) => {
     }
     const tier = verdict.route
 
-    if (verdict.isContinuation && last !== undefined && (running === undefined || running.id === last.id)) {
-      $.ui.status(`→ continue ${last.tier} worker (${verdict.by})`)
+    if (verdict.isContinuation && last !== undefined && writers.every(writer => last.some(one => one.id === writer.id))) {
+      $.ui.status(`→ continue ${last.length > 1 ? `${last.length} parts` : `${last[0]!.tier} worker`} (${verdict.by})`)
 
       return next({ ...e, text, context: [...(e.context ?? []), continueNote(last, verdict.by)] })
     }
-    if (running !== undefined) {
-      $.ui.status(`→ on hold: ${running.tier} worker still running`)
+    // A writer with no scope may touch any file: a new task waits for it. Scoped parts leave room beside them.
+    const unscoped = writers.find(writer => writer.scope === undefined)
+    if (unscoped !== undefined) {
+      $.ui.status(`→ on hold: ${writerLabel(unscoped)} still running`)
 
-      return next({ ...e, text, context: [...(e.context ?? []), waitNote(running)] })
+      return next({ ...e, text, context: [...(e.context ?? []), waitNote(unscoped)] })
     }
 
     const effort = effortFor(tier, verdict.effort)
     routed = { tier, ...(effort === undefined ? {} : { effort }), by: verdict.by }
+    await update($, partsAtom, () => [])
     $.ui.status(`→ ${tier}${effort === undefined ? '' : ` · ${effort}`} (${verdict.by})`)
 
-    return next({ ...e, text, context: [...(e.context ?? []), spawnNote(routed)] })
+    return next({ ...e, text, context: [...(e.context ?? []), spawnNote(routed, writers)] })
   }).catch(($, e, next) => {
     // The router failing must never cost the person their prompt: it goes to main as typed. This build types
     // `kind` without `re-entry`, which the docs still list for a skipped re-entrant dispatch.
@@ -982,11 +1106,15 @@ export const register: Register = (on, options) => {
   )
 
   /**
-   * One top-level worker writes at a time: a second spawn while one runs is refused, whoever asks for it.
-   * A worker starts from main's handoff with the session's record beside it, on its tier's model at the
-   * router's effort. While routing is on, a fork main starts on its own is rated as a /subtask is, and every
-   * other agent main spawns is told the handoff request is the person's; with routing off every spawn passes
-   * untouched and only goes on the board.
+   * A worker starts only beside writers (top-level workers and forks still running) whose scopes its own
+   * stays out of; one with no scope may write anywhere, so it starts only alone, whoever asks for it. A
+   * worker starts from main's handoff with the session's record beside it, on its tier's model at the
+   * router's effort; a parallel part, which its brief's `## Scope` names, is rated on its own brief and runs
+   * at that rating instead.
+   *
+   * While routing is on, a fork main starts on a routed turn is refused, as the note asks for workers; on
+   * another turn it is rated as a /subtask is, and every other agent main spawns is told the handoff request
+   * is the person's. With routing off every spawn passes untouched and only goes on the board.
    *
    * A spawn that continues a handoff (findContinuation) runs as the agent type the continuation note named
    * and on the model of the one that handed off, with its report whole ahead of main's prompt; turn.step
@@ -1002,21 +1130,27 @@ export const register: Register = (on, options) => {
     }
 
     const continuation = findContinuation(await read($, handoffsAtom), input)
+    const isOn = await isEnabled($)
+    if (input.fork && continuation === undefined && isOn && isRoutedTurn(await $.session.messages())) return { deny: FORK_REFUSED }
+
     const target = continuation === undefined ? input.subagentType : (continuation.continueAs ?? continuation.type)
+    // A part's scope: the one its brief names, or for a continuation the one the agent that handed off held.
+    const scope =
+      tierOfWorker(target) === undefined
+        ? undefined
+        : continuation !== undefined
+          ? continuation.scope
+          : SCOPE_HEADING.test(input.prompt)
+            ? readScope(input.prompt, await $.session.cwd())
+            : undefined
+    // Each part is rated on its own brief; a continuation keeps the model and effort it took over.
+    const part =
+      scope !== undefined && continuation === undefined && isOn ? await rateTask($, input.prompt, router, 'part') : undefined
+    const type = part === undefined ? target : workerType(part.tier)
     // A fork's type is its identity, and no other spawn becomes one: the type changes only between other types.
     const e: AgentSpawnInput =
-      continuation === undefined || input.fork || target === FORK_TYPE ? input : { ...input, subagentType: target }
-    const isOn = await isEnabled($)
+      input.fork || type === FORK_TYPE || type === input.subagentType ? input : { ...input, subagentType: type }
     const tier = tierOfWorker(e.subagentType)
-
-    if (tier !== undefined) {
-      const running = (await $.agent.list()).find(agent => isTopLevelWorker(agent) && isActiveStatus(agent.status))
-      if (running !== undefined) {
-        return {
-          deny: `A model-balance worker (${running.id}) is still running; two workers must not edit the same working tree at once. Tell the user this request waits until it finishes, or continue that worker with SendMessage if the request belongs to its task.`,
-        }
-      }
-    }
 
     const pin: PinSpec | undefined = await (async () => {
       if (continuation !== undefined) {
@@ -1025,12 +1159,15 @@ export const register: Register = (on, options) => {
           ...(continuedTier === undefined ? {} : { tier: continuedTier }),
           model: continuation.model,
           ...(continuation.effort === undefined ? {} : { effort: continuation.effort }),
+          ...(scope === undefined ? {} : { scope }),
         }
       }
       if (tier !== undefined) {
-        // The router's effort for the tier it routed to; a worker main picked itself runs at its tier's option.
-        const effort = routed?.tier === tier ? routed.effort : effortFor(tier)
-        return routedPin({ tier, ...(effort === undefined ? {} : { effort }), by: '' })
+        // A part runs at its own rating; another worker at the router's effort for the tier it routed to, or
+        // at its tier's option when main picked the worker itself.
+        const effort =
+          part !== undefined ? effortFor(part.tier, part.effort) : routed?.tier === tier ? routed.effort : effortFor(tier)
+        return { ...routedPin({ tier, ...(effort === undefined ? {} : { effort }), by: '' }), ...(scope === undefined ? {} : { scope }) }
       }
       if (!e.fork || !isOn) return undefined
       // A fork main started on its own: rated as a /subtask is.
@@ -1062,31 +1199,51 @@ export const register: Register = (on, options) => {
       return isOn || continuation !== undefined ? `${body}\n\n${agentNotice(pin)}` : body
     })()
 
-    if (pin !== undefined) addPending(pending, prompt, pin, await $.clock.now())
     const model = e.fork ? undefined : (continuation?.model ?? tier)
-    const started = await next({ ...e, prompt, ...(model === undefined ? {} : { model }) })
+    const launch = async (): Promise<AgentSpawnResult> => {
+      if (pin !== undefined) addPending(pending, prompt, pin, await $.clock.now())
+      const started = await next({ ...e, prompt, ...(model === undefined ? {} : { model }) })
+      if (started.agentId === undefined || started.deny !== undefined || pin === undefined) return started
+      try {
+        takePending(pending, prompt)
+        await savePin($, started.agentId, pin)
+      } catch {
+        // The pin was taken at the agent's first turn, or its requests run as the engine resolved them.
+      }
+
+      return started
+    }
+    // A worker starts only beside writers whose scopes its own stays out of. The check and the pin it leaves
+    // run one spawn at a time, so parts started in one message each see the ones before them.
+    const started =
+      tier === undefined
+        ? await launch()
+        : await oneAtATime(async (): Promise<AgentSpawnResult> => {
+            const refusal = writerRefusal(writersOf(await $.agent.list(), await read($, pinsAtom)), scope)
+
+            return refusal === undefined ? launch() : { deny: refusal }
+          })
     const agentId = started.agentId
     if (agentId === undefined || started.deny !== undefined) return started
 
     // Never throws, so what follows (the status line, the editor pane) still runs.
     try {
-      if (pin !== undefined) {
-        takePending(pending, prompt)
-        await savePin($, agentId, pin)
-      }
       if (continuation !== undefined) {
         await update($, handoffsAtom, list => patchHandoff(list, continuation.agentId, { status: 'continued', continuedBy: agentId }))
         $.ui.toast(`${handoffLabel(continuation)} ${agentId} continues the handoff of ${continuation.agentId}`)
       }
+      if (scope !== undefined) {
+        await update($, partsAtom, list => [...list.filter(one => one.agentId !== continuation?.agentId), { agentId, scope }])
+      }
     } catch {
-      // The pin was taken at the agent's first turn, or its requests run as the engine resolved them.
+      // The continuation's record or the parts list misses this start; the agent itself runs.
     }
     await trackSpawn($, e, started, pin)
     if (tier !== undefined) {
       workers.set(agentId, tier)
       lastWorkerId = agentId
       rememberLatest(workerTasks, agentId, e.prompt, BOARD_AGENTS)
-      $.ui.status(`▶ ${tier} worker: ${e.description}`)
+      $.ui.status(`▶ ${tier} worker${scope === undefined ? '' : ` in ${scopeText(scope)}`}: ${e.description}`)
       try {
         await openPaneInEditor($)
       } catch {
@@ -1157,20 +1314,37 @@ export const register: Register = (on, options) => {
   )
 
   /**
-   * A routed turn's editing is the worker's: main's own file edits are refused, except in the auto-memory
-   * directory, where main keeps saving what the person asks it to remember.
+   * A routed turn's editing is the workers': main's own file edits are refused, except in the auto-memory
+   * directory, where main keeps saving what the person asks it to remember, and, once the work is split,
+   * outside every part's scope, where main makes the shared changes the parts ask for. A parallel part edits
+   * only inside its own scope, so parts never write the same file.
    */
   on('tool.call', { tool: MAIN_WRITE_TOOLS }, async ($, e, next) => {
-    if (e.agentId !== undefined || !(await isEnabled($)) || !isRoutedTurn(await $.session.messages())) return next(e)
-
     // The matcher types `e` on one variant; the three tools name their target differently.
     const { file_path: filePath, notebook_path: notebookPath } = e as unknown as { file_path?: string; notebook_path?: string }
     const target = notebookPath ?? filePath
+
+    if (e.agentId !== undefined) {
+      const scope = pinOf(await read($, pinsAtom), e.agentId)?.scope
+      if (scope === undefined || target === undefined || isInScope(target, scope, await $.session.cwd())) return next(e)
+
+      return {
+        deny: `Your brief's scope is ${scopeText(scope)}, and ${target} lies outside it, so ${e.tool} is refused: another part or the main conversation owns that file. Do not work around it; list the change under "Open" in your report, for the main conversation to make.`,
+      }
+    }
+    if (!(await isEnabled($)) || !isRoutedTurn(await $.session.messages())) return next(e)
+
     const memory = await readMemoryIndex($)
     if (target !== undefined && memory !== undefined && isInside(target, directoryOf(memory.path))) return next(e)
+    const parts = await read($, partsAtom)
+    const root = await $.session.cwd()
+    if (target !== undefined && parts.length > 0 && !parts.some(part => isInScope(target, part.scope, root))) return next(e)
 
     return {
-      deny: `model-balance routed this request to a worker, so ${e.tool} is refused to the main conversation on this turn. Follow the routing note: hand the work to the worker. The user can prefix a prompt with #main to have the main conversation edit.`,
+      deny:
+        parts.length === 0
+          ? `model-balance routed this request to a worker, so ${e.tool} is refused to the main conversation on this turn. Follow the routing note: hand the work to the worker. The user can prefix a prompt with #main to have the main conversation edit.`
+          : `${target ?? 'This file'} lies in the scope of a parallel part (${parts.map(part => scopeText(part.scope)).join('; ')}), so ${e.tool} is refused to the main conversation: the part's worker edits there. Send the change to it with SendMessage. The user can prefix a prompt with #main to have the main conversation edit.`,
     }
   }).catch(($, e, next) =>
     // The guard keeps routing discipline, not safety: when it cannot judge, main keeps its editing tools
@@ -1320,7 +1494,7 @@ export const register: Register = (on, options) => {
             isPastHandoffPoint(tokens, window)
           ) {
             const isAsked = (await read($, handoffsAtom)).some(one => one.agentId === agentId)
-            if (!isAsked && (await isEnabled($))) await requestHandoff($, row, { tokens, window, model: usage.model, effort })
+            if (!isAsked && (await isEnabled($))) await requestHandoff($, row, { tokens, window, model: usage.model, effort, scope: pin?.scope })
           }
         }
       } catch {

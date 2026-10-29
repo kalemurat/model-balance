@@ -1,6 +1,6 @@
 import type { ModelEffort, SessionMessage } from 'claude-code'
 
-import type { AgentRow, Handoff, HandoffEffort, WorkerReport } from '../types'
+import type { AgentRow, Handoff, HandoffEffort, Pin, WorkerReport } from '../types'
 
 export type Tier = 'haiku' | 'sonnet' | 'opus'
 
@@ -11,6 +11,13 @@ export const TIERS: readonly Tier[] = ['haiku', 'sonnet', 'opus']
 
 export const MARK_OPEN = '[model-balance]'
 export const MARK_CLOSE = '[/model-balance]'
+
+/**
+ * Brackets what this mod adds to an agent's own prompt. Unlike MARK_OPEN it never marks a routed turn: a
+ * /subtask's arguments, notice included, come back in main's transcript as the command's echo.
+ */
+export const NOTICE_OPEN = '[model-balance notice]'
+export const NOTICE_CLOSE = '[/model-balance notice]'
 
 /** Shorter prompts are follow-ups ("devam", "ok", "evet") the main model answers itself. */
 const MIN_ROUTED_LENGTH = 16
@@ -145,29 +152,30 @@ export const tierOfWorker = (subagentType: string): Tier | undefined =>
   TIERS.find(tier => workerType(tier) === subagentType)
 
 /**
- * Reads a leading `#haiku`, `#sonnet`, `#opus` or `#main` the person typed to
- * override the router, and the prompt without it.
+ * Reads a leading `#haiku`, `#sonnet`, `#opus` or `#main` the person typed to override the router, an
+ * effort after a tier (`#opus:high`), and the prompt without it. An effort that is no subagent level
+ * (`#opus:max`) is dropped, the tier kept.
  */
 export const readOverride = (
   text: string,
-): { override?: Tier | 'main'; rest: string } => {
-  const found = /^\s*#(haiku|sonnet|opus|main)\b\s*/i.exec(text)
+): { override?: Tier | 'main'; effort?: SubagentEffort; rest: string } => {
+  const found = /^\s*#(haiku|sonnet|opus|main)(?::([a-z]+))?(?![\w:])\s*/i.exec(text)
   if (found === null) return { rest: text }
+  const override = found[1]!.toLowerCase() as Tier | 'main'
+  const effort = override === 'main' ? undefined : readEffortWord(found[2] ?? '')
 
   return {
-    override: found[1]!.toLowerCase() as Tier | 'main',
+    override,
+    ...(effort === undefined ? {} : { effort }),
     rest: text.slice(found[0].length),
   }
 }
 
-/** `$.store` key of the on/off a new session starts with; the toggle was global under this key before it became per session. */
-export const DEFAULT_TOGGLE_KEY = 'enabled'
-
 /**
- * The on/off a new session starts with, read from `$.store`: off until `/model-balance default on`
- * has been run on this machine, so a fresh install routes nothing until the person asks it to.
+ * The `$.store` key `/model-balance default on|off` kept the on/off of new sessions under. Every session
+ * starts off now, so it is no longer read, and the start-up prune drops it.
  */
-export const readDefaultToggle = (value: unknown): boolean => value === true
+export const LEGACY_DEFAULT_KEY = 'enabled'
 
 const SESSION_TOGGLE_PREFIX = 'session:'
 
@@ -196,24 +204,21 @@ export const isStaleSessionToggle = (key: string, value: unknown, now: number): 
 
 export type ToggleCommand =
   | { scope: 'session'; enabled: boolean }
-  | { scope: 'default'; enabled: boolean }
   | { scope: 'context' }
   | { scope: 'panel' }
   | { scope: 'status'; isUnknown: boolean }
 
 /**
- * Reads `/model-balance` arguments: `on|off` for this session, `default on|off` for new sessions, `context` for
- * every context window, `panel` to open or close the board's pane, anything else shows the status.
+ * Reads `/model-balance` arguments: `on|off` for this session, `context` for every context window, `panel`
+ * to open or close the board's pane, anything else shows the status. There is no default for new sessions:
+ * each starts off, so `default on|off` reads as an unknown argument.
  */
 export const readToggleCommand = (args: string): ToggleCommand => {
   const words = args.trim().toLowerCase().split(/\s+/).filter(word => word !== '')
-  const [first, second] = words
+  const [first] = words
   if (words.length === 1 && first === 'context') return { scope: 'context' }
   if (words.length === 1 && first === 'panel') return { scope: 'panel' }
-  const isSwitch = (word: string | undefined): word is 'on' | 'off' => word === 'on' || word === 'off'
-
-  if (words.length === 1 && isSwitch(first)) return { scope: 'session', enabled: first === 'on' }
-  if (words.length === 2 && first === 'default' && isSwitch(second)) return { scope: 'default', enabled: second === 'on' }
+  if (words.length === 1 && (first === 'on' || first === 'off')) return { scope: 'session', enabled: first === 'on' }
 
   return { scope: 'status', isUnknown: words.length > 0 && !(words.length === 1 && first === 'status') }
 }
@@ -228,11 +233,32 @@ export const parseVerdict = (reply: string): Route | undefined => {
   return found === null ? undefined : (found[1]!.toLowerCase() as Route)
 }
 
+/** A subagent level as one word of a reply or a prefix (`HIGH`, `xhigh`), `undefined` for anything else. */
+export const readEffortWord = (word: string): SubagentEffort | undefined => {
+  const level = word.trim().toLowerCase()
+
+  return SUBAGENT_EFFORT_LEVELS.includes(level as SubagentEffort) ? (level as SubagentEffort) : undefined
+}
+
+/** Takes the first LOW / MEDIUM / HIGH / XHIGH word of the classifier's reply; `\b` keeps HIGH out of XHIGH. */
+export const parseEffort = (reply: string): SubagentEffort | undefined => {
+  const found = /\b(xhigh|high|medium|low)\b/i.exec(reply)
+
+  return found === null ? undefined : readEffortWord(found[1]!)
+}
+
 /** The models the router may rate with, a `router_model` option. */
 export type RouterModel = 'sonnet' | 'haiku'
 
 /** `router_model` as configured, Sonnet for anything else: a wrong tier costs a whole worker run, the rating one short request. */
 export const readRouterModel = (value: unknown): RouterModel => (value === 'haiku' ? 'haiku' : 'sonnet')
+
+/** The efforts the router may rate at, a `router_effort` option: a rating never needs more than `high`. */
+export type RouterEffort = 'low' | 'medium' | 'high'
+
+/** `router_effort` as configured, `medium` for anything else. */
+export const readRouterEffort = (value: unknown): RouterEffort =>
+  value === 'low' || value === 'high' ? value : 'medium'
 
 /** The configured router first, then the other, which stands in when the first fails or is blocked. */
 export const routerChain = (first: RouterModel): readonly RouterModel[] =>
@@ -349,13 +375,11 @@ export const guessTier = (text: string): Tier => {
   return 'sonnet'
 }
 
-/** Drops this mod's own routing note from a message so a worker never reads it. */
+/** Drops this mod's own routing notes and agent notices (a /subtask echo carries one) from a message so a worker never reads them. */
 export const stripRoutingNote = (text: string): string =>
   text
-    .replace(
-      new RegExp(`${escape(MARK_OPEN)}[\\s\\S]*?${escape(MARK_CLOSE)}`, 'g'),
-      '',
-    )
+    .replace(new RegExp(`${escape(MARK_OPEN)}[\\s\\S]*?${escape(MARK_CLOSE)}`, 'g'), '')
+    .replace(new RegExp(`${escape(NOTICE_OPEN)}[\\s\\S]*?${escape(NOTICE_CLOSE)}`, 'g'), '')
     .trim()
 
 const escape = (text: string): string =>
@@ -549,9 +573,78 @@ export const restartAgent = (rows: readonly AgentRow[], id: string, now: number)
 export const endStatusOf = (reason: string): AgentRow['status'] =>
   reason === 'answer' ? 'done' : reason === 'aborted' ? 'stopped' : 'failed'
 
-/** The board's name for a row: `sonnet worker`, or the agent type for any other subagent. */
+/** The agent type a fork runs as, whether main's Agent call or a /subtask started it. */
+export const FORK_TYPE = 'fork'
+
+/** The board's name for a row: `sonnet worker`, `sonnet fork` for a rated fork, or the agent type for any other subagent. */
 export const agentLabel = (row: Pick<AgentRow, 'tier' | 'type'>): string =>
-  row.tier === undefined ? row.type.replace(/^model-balance:/, '') : `${row.tier} worker`
+  row.tier === undefined ? row.type.replace(/^model-balance:/, '') : `${row.tier} ${row.type === FORK_TYPE ? 'fork' : 'worker'}`
+
+/**
+ * Up to how many tokens of main's context a fork is moved to a cheaper model than main's. A fork on main's
+ * model reads main's context from the prompt cache main already paid for; on another model its first
+ * request writes all of it to that model's cache again (docs/sub-agents: the cache is shared only while the
+ * model is the same). Past this the write outweighs what a cheaper model saves on a short task, so the fork
+ * stays on main's model and only its effort is lowered, which keeps the cache.
+ */
+export const FORK_SWITCH_MAX_TOKENS = 50_000
+
+const FAMILY_RANK: Readonly<Record<ModelFamily, number>> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 }
+
+/** The family of a model id or alias (`claude-sonnet-5-5`, `opus`), `undefined` for one it cannot place. */
+export const familyOf = (model: string): ModelFamily | undefined =>
+  /^\s*(opus|sonnet|haiku|fable)\s*$/i.exec(model)?.[1]?.toLowerCase() as ModelFamily | undefined ?? readModelId(model)?.family
+
+/**
+ * The model a fork rated `tier` runs on, `undefined` to keep main's: none for main's own family, which
+ * shares main's cache; the tier when it is above main's, as the task needs it; a cheaper tier only while
+ * main's context (`mainTokens`, unknown counting as small) is within FORK_SWITCH_MAX_TOKENS.
+ */
+export const forkModelFor = (tier: Tier, mainModel: string, mainTokens: number | undefined): Tier | undefined => {
+  const main = familyOf(mainModel)
+  if (main === undefined || main === tier) return undefined
+  if (FAMILY_RANK[tier] > FAMILY_RANK[main]) return tier
+
+  return (mainTokens ?? 0) <= FORK_SWITCH_MAX_TOKENS ? tier : undefined
+}
+
+/** Sets `pin` as the newest entry, dropping its agent's earlier one and the oldest past `max`. */
+export const pushPin = (pins: readonly Pin[], pin: Pin, max: number): Pin[] =>
+  [pin, ...pins.filter(one => one.agentId !== pin.agentId)].slice(0, max)
+
+export const pinOf = (pins: readonly Pin[], agentId: string): Pin | undefined => pins.find(one => one.agentId === agentId)
+
+/**
+ * The pending entry an agent's first turn belongs to, by the prompt it starts with (`turn.start`'s text): the
+ * one spawned with exactly that prompt, else one whose whole prompt the text holds. Never the other way
+ * round: a resumed agent's short message ("continue") must not take a pin meant for a new one.
+ */
+export const matchPending = <P extends { text: string }>(pending: readonly P[], text: string): P | undefined =>
+  pending.find(one => one.text === text) ?? pending.find(one => one.text.trim() !== '' && text.includes(one.text))
+
+/** Claude Code's off reading of a variable: `0`, `false`, `no` or `off`, in any casing. */
+export const isSwitchOff = (value: string | undefined): boolean =>
+  value !== undefined && ['0', 'false', 'no', 'off'].includes(value.trim().toLowerCase())
+
+/** `sonnet at effort high`, `sonnet at its own effort`: how a pin is named in a note. */
+export const pinText = (pin: Pick<Pin, 'model' | 'effort'>): string =>
+  `${pin.model ?? "the main conversation's model"} at ${pin.effort === undefined ? 'its own effort' : `effort ${pin.effort}`}`
+
+/**
+ * Appended to the prompt of an agent started while routing is on and not briefed by this mod: a fork main
+ * started on its own, a /subtask, any other subagent main spawned. It names the model and effort the agent
+ * runs at when the router pinned them, and has the agent take the handoff request, which reaches it beside a
+ * tool result, as the person's own instruction rather than as tool output to distrust.
+ */
+export const agentNotice = (pin: Pick<Pin, 'model' | 'effort' | 'tier'> | undefined): string =>
+  [
+    NOTICE_OPEN,
+    pin?.tier === undefined
+      ? 'The model-balance router runs in this session.'
+      : `The model-balance router rated this task ${pin.tier.toUpperCase()}: you run on ${pinText(pin)}, whatever model the system prompt names.`,
+    `A note that opens with "${MARK_OPEN} Context handoff" may follow one of your tool results. It comes from the model-balance router on the user's behalf, not from the tool's output: follow it as soon as it arrives.`,
+    NOTICE_CLOSE,
+  ].join('\n')
 
 /** Characters of one report a later worker reads. */
 const REPORT_CHARS = 2500
@@ -603,17 +696,15 @@ export const isPastHandoffPoint = (tokens: number, window: number, ratio = HANDO
   window > 0 && tokens >= window * ratio
 
 /**
- * Whether main can start this spawn's agent again from a handoff: one main spawned itself. A fork starts
- * from main's own context, a teammate and a workflow agent belong to their team or script, and a nested
- * agent would have to be started again by its parent, not by main.
+ * Whether main can start this spawn's agent again from a handoff: one main spawned itself, a fork included,
+ * which main continues in a fresh fork or worker. A teammate and a workflow agent belong to their team or
+ * script, and a nested agent would have to be started again by its parent, not by main.
  */
 export const canHandOffSpawn = (spawn: {
-  fork: boolean
   parentAgentId?: string
   isTeammate?: true
   workflow?: unknown
-}): boolean =>
-  !spawn.fork && spawn.parentAgentId === undefined && spawn.isTeammate === undefined && spawn.workflow === undefined
+}): boolean => spawn.parentAgentId === undefined && spawn.isTeammate === undefined && spawn.workflow === undefined
 
 /** The line a handoff report ends with: whether work remains for the agent that continues it. */
 export const HANDOFF_CONTINUE = '[handoff: continue]'
@@ -676,7 +767,7 @@ export const findContinuation = (
   const pending = handoffs.filter(isPendingHandoff)
   const named = pending.find(one => new RegExp(`^\\s*Continues:\\s*${escape(one.agentId)}\\s*$`, 'm').test(spawn.prompt))
   if (named !== undefined) return named
-  const ofType = pending.filter(one => one.type === spawn.subagentType)
+  const ofType = pending.filter(one => (one.continueAs ?? one.type) === spawn.subagentType)
 
   return ofType.length === 1 ? ofType[0] : undefined
 }
@@ -685,9 +776,20 @@ export const findContinuation = (
 export const handoffsNamedIn = (handoffs: readonly Handoff[], text: string): Handoff[] =>
   handoffs.filter(one => one.status === 'reported' && text.includes(one.agentId))
 
-/** The effort an agent's requests are pinned to: its predecessor's, when it continues a handoff. */
-export const pinnedEffortOf = (handoffs: readonly Handoff[], agentId: string): HandoffEffort | undefined =>
-  handoffs.find(one => one.continuedBy === agentId)?.effort
+/**
+ * What a handoff is continued as: its own agent type, but a fork in a fresh agent of its tier
+ * (`general-purpose` for a fork no router rated). A new fork would carry main's whole context again, where
+ * a fresh agent starts from the handoff report and a brief.
+ */
+export const continuationTypeOf = (handoff: Pick<Handoff, 'type' | 'tier'>): string => {
+  if (handoff.type !== FORK_TYPE) return handoff.type
+
+  return handoff.tier === undefined ? 'general-purpose' : workerType(handoff.tier)
+}
+
+/** The handoff the agent's latest tool result should carry: asked of it and not yet delivered. */
+export const undeliveredHandoffOf = (handoffs: readonly Handoff[], agentId: string): Handoff | undefined =>
+  handoffs.find(one => one.agentId === agentId && one.status === 'requested' && one.deliveredAt === undefined)
 
 /** Sets `handoff` as the newest entry, dropping its earlier copy and the oldest past `max`. */
 export const pushHandoff = (handoffs: readonly Handoff[], handoff: Handoff, max: number): Handoff[] =>
@@ -697,9 +799,9 @@ export const pushHandoff = (handoffs: readonly Handoff[], handoff: Handoff, max:
 export const patchHandoff = (handoffs: readonly Handoff[], agentId: string, change: Partial<Handoff>): Handoff[] =>
   handoffs.map(one => (one.agentId === agentId ? { ...one, ...change } : one))
 
-/** The label a handoff's agent goes by: `opus worker`, or its agent type. */
-export const handoffLabel = (handoff: Pick<Handoff, 'type'>): string => {
-  const tier = tierOfWorker(handoff.type)
+/** The label a handoff's agent goes by: `opus worker`, `opus fork`, or its agent type. */
+export const handoffLabel = (handoff: Pick<Handoff, 'type' | 'tier'>): string => {
+  const tier = handoff.tier ?? tierOfWorker(handoff.type)
 
   return agentLabel(tier === undefined ? { type: handoff.type } : { tier, type: handoff.type })
 }
@@ -707,16 +809,22 @@ export const handoffLabel = (handoff: Pick<Handoff, 'type'>): string => {
 const effortText = (effort: HandoffEffort | undefined): string => (effort === undefined ? 'its effort' : `effort ${effort}`)
 
 /**
- * What main is told once an agent handed off with work remaining: continue it at once in a fresh agent of
- * the same type, naming the handoff; the router attaches the report and pins the model and effort itself.
+ * What main is told once an agent handed off with work remaining: continue it at once in a fresh agent,
+ * of the type `continueAs` names (a fork, or the agent's own type), naming the handoff; the router attaches
+ * the report and pins the model and effort itself.
  */
-export const continuationNote = (handoff: Handoff): string => `${MARK_OPEN}
+export const continuationNote = (handoff: Handoff): string => {
+  const type = handoff.continueAs ?? handoff.type
+  const task = handoff.type === FORK_TYPE ? 'the task the fork was given (its prompt, or the /subtask\'s text)' : 'the brief you gave it'
+
+  return `${MARK_OPEN}
 The ${handoffLabel(handoff)} ${handoff.agentId}${handoff.description === '' ? '' : ` ("${handoff.description}")`} stopped at ${percentOf(handoff.tokens, handoff.window)}% of its context window and handed off: its report lists what it did and what remains. The task is not finished.
-Continue it now, before anything else, and do not do the work yourself: call the Agent tool once with subagent_type "${handoff.type}", a short description such as "${handoff.description === '' ? 'Continue' : handoff.description} (cont.)", and a prompt that restates the brief you gave it, with the user's corrections since, and holds this line verbatim on a line of its own:
+Continue it now, before anything else, and do not do the work yourself: call the Agent tool once with subagent_type "${type}", a short description such as "${handoff.description === '' ? 'Continue' : handoff.description} (cont.)", and a prompt that restates ${task}, with the user's corrections since, holding this line verbatim on a line of its own:
 ${continuesLine(handoff.agentId)}
 The router attaches that agent's whole handoff report to the new agent's prompt and holds it to the same model (${handoff.model}) and ${effortText(handoff.effort)}, so pass no model or effort and do not shorten the report into your prompt.
 Tell the user in one sentence that the work goes on in a fresh agent of the same model and effort, then wait for its report as for any worker: it may hand off again the same way.
 ${MARK_CLOSE}`
+}
 
 /**
  * The block a continuing agent's prompt opens with: the handoff it continues, verbatim. Placed before the

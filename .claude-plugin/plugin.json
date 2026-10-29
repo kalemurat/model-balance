@@ -1,12 +1,12 @@
 {
   "name": "model-balance",
-  "version": "0.8.0",
-  "description": "Routes each prompt to the main conversation or to a Haiku, Sonnet or Opus worker subagent by its difficulty, whatever the main model is, each worker at its own effort and never at max. Main briefs each worker, follow-ups continue the last worker, and a board shows the running subagents with the finished ones behind a button. Switched on and off per session.",
+  "version": "1.0.0",
+  "description": "Spends fewer tokens on the same work: a router picks each prompt's model and effort, and the main conversation answers it or hands it to a Haiku, Sonnet or Opus worker subagent pinned to both, never at max. Main briefs each worker and relays its report, follow-ups continue the last worker, /subtask and forks get a pinned effort, and a board shows the running subagents with the finished ones behind a button. Off at the start of every session, switched on per session.",
   "author": { "name": "Murat KALE" },
   "homepage": "https://github.com/kalemurat/model-balance",
   "repository": "https://github.com/kalemurat/model-balance",
   "license": "MIT",
-  "keywords": ["routing", "subagents", "haiku", "sonnet", "opus", "context", "effort"],
+  "keywords": ["routing", "subagents", "haiku", "sonnet", "opus", "context", "effort", "tokens"],
   "types": "./types/index.d.ts",
   "userConfig": {
     "router_model": {
@@ -16,24 +16,31 @@
       "options": ["sonnet", "haiku"],
       "default": "sonnet"
     },
+    "router_effort": {
+      "type": "string",
+      "title": "Router effort",
+      "description": "Effort the router rates each prompt at, choosing both the worker's model and its effort. A rating is one short request, so it never needs more than high.",
+      "options": ["low", "medium", "high"],
+      "default": "medium"
+    },
     "haiku_effort": {
       "type": "string",
       "title": "Haiku worker effort",
-      "description": "Effort the Haiku worker runs at, set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
+      "description": "Effort the Haiku worker runs at when the router names none (a #haiku prefix, the heuristic), set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
       "options": ["low", "medium", "high", "xhigh", "session"],
       "default": "medium"
     },
     "sonnet_effort": {
       "type": "string",
       "title": "Sonnet worker effort",
-      "description": "Effort the Sonnet worker runs at, set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
+      "description": "Effort the Sonnet worker runs at when the router names none (a #sonnet prefix, the heuristic), set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
       "options": ["low", "medium", "high", "xhigh", "session"],
       "default": "high"
     },
     "opus_effort": {
       "type": "string",
       "title": "Opus worker effort",
-      "description": "Effort the Opus worker runs at, set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
+      "description": "Effort the Opus worker runs at when the router names none (a #opus prefix, the heuristic), set as its agent definition's effort. 'session' sets none and leaves it to Claude Code's own resolution. Subagents never run at max.",
       "options": ["low", "medium", "high", "xhigh", "session"],
       "default": "xhigh"
     }

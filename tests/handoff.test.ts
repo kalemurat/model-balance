@@ -5,12 +5,12 @@ import type {
   PromptSubmitInput,
   SessionMessage,
   SessionSendInput,
-  SessionSendResult,
+  ToolCallResult,
   TurnStepInput,
   TurnStopReason,
 } from 'claude-code'
 
-import { HANDOFF_COMPLETE, HANDOFF_CONTINUE, continuesLine } from '../hooks/route'
+import { HANDOFF_COMPLETE, HANDOFF_CONTINUE, NOTICE_OPEN, continuesLine } from '../hooks/route'
 import type { AgentRow, Handoff } from '../types'
 
 const OPUS = 'model-balance:opus-worker'
@@ -33,11 +33,12 @@ type Answer = { tokens: number; stopReason: TurnStopReason }
 const TRANSCRIPT: SessionMessage[] = [{ role: 'user', text: 'Migrate the store to signals.', toolUses: [] }]
 
 /**
- * The session beneath the plugin: routing on unless `enabled` is false, no other agent running, and every
- * send, spawn, prompt, request and state write recorded as it reached the bottom.
+ * The session beneath the plugin: routing on unless `enabled` is false (this session's own saved choice:
+ * nothing else turns it on), no other agent running, and every send, spawn, prompt, request and state
+ * write recorded as it reached the bottom.
  */
-const session = (on: On, options: { enabled?: boolean; delivered?: SessionSendResult } = {}) => {
-  mock.store(on, { enabled: options.enabled ?? true })
+const session = (on: On, options: { enabled?: boolean } = {}) => {
+  mock.store(on, options.enabled === false ? {} : { 'session:s-1': { enabled: true, at: 1000 } })
   mock.env(on, {})
   mock.clock(on, { now: 1000 })
   on('ui.status', () => ({ value: undefined }))
@@ -49,12 +50,16 @@ const session = (on: On, options: { enabled?: boolean; delivered?: SessionSendRe
   on('session.surfaces', () => ({ value: ['terminal'] }))
   on('agent.list', () => ({ value: [] }))
 
+  // The handoff request goes beside a tool result: a send would meet SendMessage's permission check.
   const sends: SessionSendInput[] = []
   on('session.send', (_, e) => {
     sends.push(e)
 
-    return options.delivered ?? { isDelivered: true }
+    return { isDelivered: true }
   })
+  // Any tool answers plainly; Agent with `agentResult`, the record a test sets for a foreground run.
+  const tools: { agentResult?: unknown } = {}
+  on('tool.call', (_, e) => (e.tool === 'Agent' ? ({ result: tools.agentResult } as never) : ({ result: { stdout: 'ok' } } as never)))
   const spawns: AgentSpawnInput[] = []
   on('agent.spawn', (_, e) => {
     spawns.push(e)
@@ -99,6 +104,7 @@ const session = (on: On, options: { enabled?: boolean; delivered?: SessionSendRe
   })
 
   return {
+    tools,
     sends,
     spawns,
     prompts,
@@ -108,6 +114,8 @@ const session = (on: On, options: { enabled?: boolean; delivered?: SessionSendRe
     agents: (): AgentRow[] => (state.get('agents') as AgentRow[] | undefined) ?? [],
   }
 }
+
+const USAGE = { input_tokens: 300, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 const spawnOf = (change: Partial<AgentSpawnInput> = {}): AgentSpawnInput => ({
   tool_use_id: 'toolu_1',
@@ -132,6 +140,13 @@ const step = async ($: Engine, agentId: string, effort: TurnStepInput['effort'] 
 
 const complete = ($: Engine, agentId: string, answer: string, reason: 'answer' | 'error' | 'aborted' = 'answer') =>
   $.turn.complete({ answer, durationMs: 60_000, isAborted: reason === 'aborted', turnId: `t-${agentId}`, agentId, reason })
+
+/** One tool call of `agentId`'s loop, as its model makes it; the context it reads beside the result. */
+const toolCall = async ($: Engine, agentId: string | undefined): Promise<string> => {
+  const called = (await $.tool.call({ tool: 'Bash', command: 'ls', ...(agentId === undefined ? {} : { agentId }) } as never)) as ToolCallResult
+
+  return called.context?.join('\n') ?? ''
+}
 
 const notify = ($: Engine, agentId: string) =>
   $.prompt.submit({
@@ -164,31 +179,34 @@ test('compaction runs as usual while routing is off', async ($, on) => {
   }
 })
 
-test('a subagent is asked to hand off once, at 65%, and only while its run goes on', async ($, on) => {
+test('a subagent is asked to hand off once, at 65%, beside its next tool result, and only while its run goes on', async ($, on) => {
   const world = session(on)
   expect((await $.agent.spawn(spawnOf())).agentId).toBe('a-1')
 
   world.answer.tokens = 649_000
   await step($, 'a-1')
-  expect(world.sends).toHaveLength(0)
+  expect(world.handoffs()).toEqual([])
+  expect(await toolCall($, 'a-1')).toBe('')
 
-  // A message to a run that ends here would start it again (docs/sub-agents), so none goes.
+  // A run that ends here makes no tool call to carry the request, so none is recorded.
   world.answer.tokens = 650_000
   world.answer.stopReason = 'end_turn'
   await step($, 'a-1')
-  expect(world.sends).toHaveLength(0)
+  expect(world.handoffs()).toEqual([])
 
   world.answer.stopReason = 'tool_use'
   await step($, 'a-1')
-  expect(world.sends).toHaveLength(1)
-  expect(JSON.stringify(world.sends[0]!.to)).toContain('a-1')
-  expect(world.sends[0]!.text).toContain('Context handoff')
-  expect(world.sends[0]!.text).toContain('65% full (650k of 1M tokens)')
-  expect(world.sends[0]!.origin).toEqual({ kind: 'plugin', name: 'model-balance' })
+  // Main's own tool calls never carry it.
+  expect(await toolCall($, undefined)).toBe('')
+  const request = await toolCall($, 'a-1')
+  expect(request).toContain('Context handoff')
+  expect(request).toContain('65% full (650k of 1M tokens)')
+  expect(await toolCall($, 'a-1')).toBe('')
+  expect(world.sends).toHaveLength(0)
 
   world.answer.tokens = 700_000
   await step($, 'a-1')
-  expect(world.sends).toHaveLength(1)
+  expect(await toolCall($, 'a-1')).toBe('')
 
   expect(world.handoffs()).toEqual([
     expect.objectContaining({
@@ -200,6 +218,7 @@ test('a subagent is asked to hand off once, at 65%, and only while its run goes 
       tokens: 650_000,
       window: 1_000_000,
       status: 'requested',
+      deliveredAt: 1000,
     }),
   ])
   expect(world.agents().find(row => row.id === 'a-1')).toMatchObject({ canHandOff: true, handoffAt: 65 })
@@ -210,49 +229,41 @@ test('an agent resumed after it was asked keeps the mark and is not asked again'
   await $.agent.spawn(spawnOf())
   world.answer.tokens = 650_000
   await step($, 'a-1')
-  expect(world.sends).toHaveLength(1)
+  expect(await toolCall($, 'a-1')).toContain('Context handoff')
 
   // SendMessage resumes the run: a spawn with `resume`, under the same id.
   await $.agent.spawn(spawnOf({ prompt: 'One more thing.', resume: { agentId: 'a-1' } }))
   expect(world.agents().find(row => row.id === 'a-1')).toMatchObject({ status: 'running', handoffAt: 65, canHandOff: true })
   world.answer.tokens = 720_000
   await step($, 'a-1')
-  expect(world.sends).toHaveLength(1)
+  expect(await toolCall($, 'a-1')).toBe('')
   // A resume is never taken for the continuation of a pending handoff.
   expect(world.spawns[1]!.prompt).toBe('One more thing.')
 })
 
-test('a fork, a nested agent and a teammate are never asked: main cannot start them again', async ($, on) => {
+test('a nested agent and a teammate are never asked, as main cannot start them again; a fork is', async ($, on) => {
   const world = session(on)
-  await $.agent.spawn(spawnOf({ subagentType: 'fork', fork: true }))
+  on('model.complete', () => ({ value: { isAnswered: true, text: 'OPUS HIGH', usage: USAGE } }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
   await $.agent.spawn(spawnOf({ subagentType: 'Explore', parentAgentId: 'a-9' }))
   await $.agent.spawn(spawnOf({ subagentType: 'teammate', isTeammate: true }))
+  await $.agent.spawn(spawnOf({ subagentType: 'fork', fork: true }))
 
   world.answer.tokens = 900_000
   for (const agentId of ['a-1', 'a-2', 'a-3']) await step($, agentId)
-  expect(world.sends).toHaveLength(0)
-  expect(world.agents().some(row => row.canHandOff === true)).toBe(false)
+  expect(world.handoffs().map(one => one.agentId)).toEqual(['a-3'])
+  expect(world.agents().filter(row => row.canHandOff === true).map(row => row.id)).toEqual(['a-3'])
 })
 
-test('no handoff is asked while routing is off', async ($, on) => {
+test('no handoff is asked while routing is off, and the spawn passes untouched', async ($, on) => {
   const world = session(on, { enabled: false })
   await $.agent.spawn(spawnOf({ subagentType: 'general-purpose' }))
+  expect(world.spawns[0]!.prompt).toBe('Migrate the store to signals.')
 
   world.answer.tokens = 900_000
   await step($, 'a-1')
-  expect(world.sends).toHaveLength(0)
+  expect(await toolCall($, 'a-1')).toBe('')
   expect(world.handoffs()).toEqual([])
-})
-
-test('a handoff that cannot be delivered is not retried at every later step', async ($, on) => {
-  const world = session(on, { delivered: { isDelivered: false, reason: 'the agent is gone' } })
-  await $.agent.spawn(spawnOf())
-
-  world.answer.tokens = 800_000
-  await step($, 'a-1')
-  await step($, 'a-1')
-  expect(world.sends).toHaveLength(1)
-  expect(world.handoffs()[0]?.status).toBe('ended')
 })
 
 test('a handoff goes from the report to main and on to a fresh worker with the report, model and effort', async ($, on) => {
@@ -312,13 +323,15 @@ test('a spawn of the same type continues the one pending handoff even without th
   const prompt = world.spawns[1]!.prompt
   expect(prompt.startsWith('<previous_agent_handoff agent="a-1" type="general-purpose" context="70%">')).toBe(true)
   expect(prompt).toContain(REPORT)
-  expect(prompt.endsWith('Continue the migration.')).toBe(true)
+  // The agent is told the handoff note is the user's, so it hands off again in turn.
+  expect(prompt).toContain(`Continue the migration.\n\n${NOTICE_OPEN}`)
   expect(world.spawns[1]!.model).toBe('claude-opus-5-5')
   expect(world.handoffs()[0]).toMatchObject({ status: 'continued', continuedBy: 'a-2' })
 
   // Done once: the next spawn of that type starts fresh.
   await $.agent.spawn(spawnOf({ subagentType: 'general-purpose', prompt: 'Something else.' }))
-  expect(world.spawns[2]!.prompt).toBe('Something else.')
+  expect(world.spawns[2]!.prompt.startsWith(`Something else.\n\n${NOTICE_OPEN}`)).toBe(true)
+  expect(world.spawns[2]!.prompt).not.toContain('<previous_agent_handoff')
 })
 
 test('a run that finished its task, failed or was stopped after the request is not continued', async ($, on) => {
@@ -326,7 +339,7 @@ test('a run that finished its task, failed or was stopped after the request is n
   for (let index = 0; index < 3; index++) await $.agent.spawn(spawnOf({ subagentType: 'general-purpose' }))
   world.answer.tokens = 700_000
   for (const agentId of ['a-1', 'a-2', 'a-3']) await step($, agentId)
-  expect(world.sends).toHaveLength(3)
+  expect(world.handoffs()).toHaveLength(3)
 
   await complete($, 'a-1', `## Result: all done.\n${HANDOFF_COMPLETE}`)
   await complete($, 'a-2', 'Partial output before the API error.', 'error')
@@ -348,17 +361,15 @@ test('a run that finished its task, failed or was stopped after the request is n
 test("a foreground agent's handoff reaches main beside the Agent tool's result", async ($, on) => {
   const world = session(on)
   // The Agent tool's own record of a foreground run that finished.
-  on('tool.call', () => ({
-    result: {
-      status: 'completed',
-      agentId: 'a-1',
-      content: [{ type: 'text', text: REPORT }],
-      totalToolUseCount: 30,
-      totalDurationMs: 60_000,
-      totalTokens: 650_000,
-      prompt: 'Migrate the store to signals.',
-    },
-  }) as never)
+  world.tools.agentResult = {
+    status: 'completed',
+    agentId: 'a-1',
+    content: [{ type: 'text', text: REPORT }],
+    totalToolUseCount: 30,
+    totalDurationMs: 60_000,
+    totalTokens: 650_000,
+    prompt: 'Migrate the store to signals.',
+  }
   await $.agent.spawn(spawnOf({ background: false }))
   world.answer.tokens = 650_000
   await step($, 'a-1')

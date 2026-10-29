@@ -43,7 +43,7 @@ import {
   parseVerdict,
   readOverride,
   readQuestions,
-  readDefaultToggle,
+  LEGACY_DEFAULT_KEY,
   readSavedToggle,
   readToggleCommand,
   sessionToggleKey,
@@ -63,7 +63,21 @@ import {
   handoffsNamedIn,
   isPastHandoffPoint,
   patchHandoff,
-  pinnedEffortOf,
+  FORK_SWITCH_MAX_TOKENS,
+  FORK_TYPE,
+  NOTICE_CLOSE,
+  NOTICE_OPEN,
+  agentNotice,
+  continuationTypeOf,
+  familyOf,
+  forkModelFor,
+  matchPending,
+  parseEffort,
+  pinOf,
+  pushPin,
+  readEffortWord,
+  readRouterEffort,
+  undeliveredHandoffOf,
   pushHandoff,
   readHandoffOutcome,
   stripRoutingNote,
@@ -306,20 +320,16 @@ test('answers go back verbatim and a dismissed question stops the worker', async
   expect(dismissed).toContain('Do not guess')
 })
 
-test('on/off switches this session, default on/off the sessions to come', async () => {
+test('on/off switches this session only; there is no default for new sessions', async () => {
   expect(readToggleCommand(' ON ')).toEqual({ scope: 'session', enabled: true })
   expect(readToggleCommand('off')).toEqual({ scope: 'session', enabled: false })
-  expect(readToggleCommand('default  on')).toEqual({ scope: 'default', enabled: true })
   expect(readToggleCommand('')).toEqual({ scope: 'status', isUnknown: false })
   expect(readToggleCommand('status')).toEqual({ scope: 'status', isUnknown: false })
+  // Every session starts off: the old `default on|off` reads as an unknown argument.
+  expect(readToggleCommand('default  on')).toEqual({ scope: 'status', isUnknown: true })
   expect(readToggleCommand('default')).toEqual({ scope: 'status', isUnknown: true })
   expect(readToggleCommand('on please')).toEqual({ scope: 'status', isUnknown: true })
-
-  // A fresh install routes nothing until `default on` has been run.
-  expect(readDefaultToggle(undefined)).toBe(false)
-  expect(readDefaultToggle(false)).toBe(false)
-  expect(readDefaultToggle('true')).toBe(false)
-  expect(readDefaultToggle(true)).toBe(true)
+  expect(LEGACY_DEFAULT_KEY).toBe('enabled')
 })
 
 test('saved session choices are read strictly and pruned past their TTL', async () => {
@@ -443,12 +453,11 @@ test('the handoff point is 65% of the window, reached at the boundary itself', a
   expect(isPastHandoffPoint(500, 1000, 0.5)).toBe(true)
 })
 
-test('only an agent main spawned itself can be started again from a handoff', async () => {
-  expect(canHandOffSpawn({ fork: false })).toBe(true)
-  expect(canHandOffSpawn({ fork: true })).toBe(false)
-  expect(canHandOffSpawn({ fork: false, parentAgentId: 'a-0' })).toBe(false)
-  expect(canHandOffSpawn({ fork: false, isTeammate: true })).toBe(false)
-  expect(canHandOffSpawn({ fork: false, workflow: { runId: 'wf_1', agentIndex: 1 } })).toBe(false)
+test('only an agent main spawned itself, a fork included, can be started again from a handoff', async () => {
+  expect(canHandOffSpawn({})).toBe(true)
+  expect(canHandOffSpawn({ parentAgentId: 'a-0' })).toBe(false)
+  expect(canHandOffSpawn({ isTeammate: true })).toBe(false)
+  expect(canHandOffSpawn({ workflow: { runId: 'wf_1', agentIndex: 1 } })).toBe(false)
 })
 
 test('a handoff report says whether work remains: its last marker, else its Remaining section', async () => {
@@ -502,17 +511,12 @@ test('a continuation is the handoff its prompt names, else the one pending of it
   }
 })
 
-test('a notification names the reported handoffs it carries; pinned effort follows the predecessor', async () => {
+test('a notification names the reported handoffs it carries', async () => {
   const list = [handoff(), handoff({ agentId: 'a-2', status: 'announced' }), handoff({ agentId: 'a-3', status: 'requested' })]
   const text = '<task-notification>\n<task-id>a-1</task-id>\n<status>completed</status>\n</task-notification>'
   expect(handoffsNamedIn(list, text).map(one => one.agentId)).toEqual(['a-1'])
   expect(handoffsNamedIn(list, '<task-notification><task-id>a-2</task-id>')).toEqual([])
   expect(handoffsNamedIn(list, '<task-notification><task-id>a-3</task-id>')).toEqual([])
-
-  const chain = [handoff({ status: 'continued', continuedBy: 'a-5', effort: 'high' }), handoff({ agentId: 'a-6', continuedBy: 'a-7', effort: 4096 })]
-  expect(pinnedEffortOf(chain, 'a-5')).toBe('high')
-  expect(pinnedEffortOf(chain, 'a-7')).toBe(4096)
-  expect(pinnedEffortOf(chain, 'a-1')).toBeUndefined()
 })
 
 test('handoffs are kept newest first, replaced by agent and patched in place', async () => {
@@ -560,4 +564,93 @@ test('the continuing agent gets the handoff report whole, never clipped', async 
   expect(block.startsWith('<previous_agent_handoff agent="a-1" type="model-balance:opus-worker" context="65%">')).toBe(true)
   expect(block).toContain('same model and effort as you')
   expect(block.endsWith('</previous_agent_handoff>')).toBe(true)
+})
+
+test('an override names a tier and, after a colon, an effort; an effort that is no subagent level is dropped', async () => {
+  expect(readOverride('#opus:high migrate the store')).toEqual({ override: 'opus', effort: 'high', rest: 'migrate the store' })
+  expect(readOverride('  #Sonnet:XHIGH fix it')).toEqual({ override: 'sonnet', effort: 'xhigh', rest: 'fix it' })
+  expect(readOverride('#haiku rename it')).toEqual({ override: 'haiku', rest: 'rename it' })
+  expect(readOverride('#opus:max plan it')).toEqual({ override: 'opus', rest: 'plan it' })
+  expect(readOverride('#main:high answer')).toEqual({ override: 'main', rest: 'answer' })
+  expect(readOverride('#opusx do it')).toEqual({ rest: '#opusx do it' })
+  expect(readEffortWord(' Medium ')).toBe('medium')
+  expect(readEffortWord('max')).toBeUndefined()
+})
+
+test("the router's reply names the level and the effort; HIGH is never read out of XHIGH", async () => {
+  expect(parseVerdict('SONNET HIGH NEW')).toBe('sonnet')
+  expect(parseEffort('SONNET HIGH NEW')).toBe('high')
+  expect(parseEffort('OPUS XHIGH')).toBe('xhigh')
+  expect(parseEffort('haiku low')).toBe('low')
+  expect(parseEffort('MAIN NEW')).toBeUndefined()
+  expect(isContinuationReply('SONNET MEDIUM CONTINUE')).toBe(true)
+  expect(readRouterEffort(undefined)).toBe('medium')
+  expect(readRouterEffort('high')).toBe('high')
+  expect(readRouterEffort('xhigh')).toBe('medium')
+})
+
+test("a fork keeps main's model, and so its cache, unless the switch pays for itself", async () => {
+  expect(familyOf('claude-opus-5-5')).toBe('opus')
+  expect(familyOf('sonnet')).toBe('sonnet')
+  expect(familyOf('us.anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('haiku')
+  expect(familyOf('my-gateway-model')).toBeUndefined()
+
+  // Main's own family shares main's cache: no switch.
+  expect(forkModelFor('opus', 'claude-opus-5-5', 10_000)).toBeUndefined()
+  // A harder task than main's model goes up, whatever the cache costs.
+  expect(forkModelFor('opus', 'claude-sonnet-5-5', 900_000)).toBe('opus')
+  // Down only while main's context is small enough for the cache write to pay off.
+  expect(forkModelFor('haiku', 'claude-opus-5-5', FORK_SWITCH_MAX_TOKENS)).toBe('haiku')
+  expect(forkModelFor('sonnet', 'claude-opus-5-5', undefined)).toBe('sonnet')
+  expect(forkModelFor('sonnet', 'claude-opus-5-5', FORK_SWITCH_MAX_TOKENS + 1)).toBeUndefined()
+  expect(forkModelFor('haiku', 'my-gateway-model', 0)).toBeUndefined()
+})
+
+test('pins are kept per agent, newest first; a pending pin matches the prompt its agent starts with', async () => {
+  const pins = pushPin(pushPin([], { agentId: 'a-1', tier: 'haiku', effort: 'low', at: 1 }, 2), { agentId: 'a-2', model: 'sonnet', at: 2 }, 2)
+  expect(pins.map(one => one.agentId)).toEqual(['a-2', 'a-1'])
+  expect(pushPin(pins, { agentId: 'a-1', effort: 'high', at: 3 }, 2).map(one => [one.agentId, one.effort])).toEqual([['a-1', 'high'], ['a-2', undefined]])
+  expect(pushPin(pins, { agentId: 'a-3', at: 3 }, 2).map(one => one.agentId)).toEqual(['a-3', 'a-2'])
+  expect(pinOf(pins, 'a-1')?.effort).toBe('low')
+  expect(pinOf(pins, 'a-9')).toBeUndefined()
+
+  const pending = [{ text: 'Draft the parser tests.\n\n[notice]', pin: 1 }, { text: 'Fix the login form.', pin: 2 }]
+  expect(matchPending(pending, 'Fix the login form.')?.pin).toBe(2)
+  // The engine may wrap the prompt; the whole of it is still there.
+  expect(matchPending(pending, 'Task:\nDraft the parser tests.\n\n[notice]')?.pin).toBe(1)
+  // A resumed agent's short message never takes a pin meant for a new one.
+  expect(matchPending(pending, 'Fix')).toBeUndefined()
+  expect(matchPending(pending, '')).toBeUndefined()
+})
+
+test("an agent's notice names its pin and has it take the handoff note as the user's; the excerpt drops it", async () => {
+  const notice = agentNotice({ tier: 'haiku', model: 'haiku', effort: 'low' })
+  expect(notice.startsWith(NOTICE_OPEN)).toBe(true)
+  expect(notice.endsWith(NOTICE_CLOSE)).toBe(true)
+  expect(notice).toContain('rated this task HAIKU: you run on haiku at effort low')
+  expect(notice).toContain(`"${MARK_OPEN} Context handoff"`)
+  expect(notice).toContain("not from the tool's output")
+  expect(agentNotice({ tier: 'sonnet', effort: 'medium' })).toContain("you run on the main conversation's model at effort medium")
+  expect(agentNotice(undefined)).toContain('The model-balance router runs in this session.')
+  // A notice never counts as a routing note: it carries no MARK_OPEN of its own.
+  expect(NOTICE_OPEN.includes(MARK_OPEN)).toBe(false)
+  expect(stripRoutingNote(`/subtask draft tests\n\n${notice}`)).toBe('/subtask draft tests')
+})
+
+test('a fork is continued in a fresh agent of its tier; the request goes out once, beside one tool result', async () => {
+  expect(continuationTypeOf({ type: FORK_TYPE, tier: 'sonnet' })).toBe('model-balance:sonnet-worker')
+  expect(continuationTypeOf({ type: FORK_TYPE })).toBe('general-purpose')
+  expect(continuationTypeOf({ type: 'Explore' })).toBe('Explore')
+  expect(agentLabel({ tier: 'sonnet', type: FORK_TYPE })).toBe('sonnet fork')
+  expect(handoffLabel({ type: FORK_TYPE, tier: 'haiku' })).toBe('haiku fork')
+
+  const list = [handoff({ status: 'requested' }), handoff({ agentId: 'a-2', status: 'requested', deliveredAt: 5 })]
+  expect(undeliveredHandoffOf(list, 'a-1')?.agentId).toBe('a-1')
+  expect(undeliveredHandoffOf(list, 'a-2')).toBeUndefined()
+  expect(undeliveredHandoffOf([handoff({ status: 'reported' })], 'a-1')).toBeUndefined()
+
+  const note = continuationNote(handoff({ type: FORK_TYPE, tier: 'sonnet', continueAs: 'model-balance:sonnet-worker' }))
+  expect(note).toContain('subagent_type "model-balance:sonnet-worker"')
+  expect(note).toContain("/subtask's text")
+  expect(note).toContain('sonnet fork a-1')
 })

@@ -9,11 +9,12 @@ export type MainContext = { tokens?: number; window: number; percent?: number }
 
 /**
  * One subagent of this session as the board shows it, the latest run of it: a resume through SendMessage
- * starts the clock again. `tier` is set for a model-balance worker only; `contextTokens` is the input side
- * of its latest request, absent before the first one came back.
+ * starts the clock again. `tier` is set for an agent the router rated (a worker, a fork, a /subtask);
+ * `contextTokens` is the input side of its latest request, absent before the first one came back.
  *
- * `canHandOff` marks a subagent main spawned itself, not a fork, teammate or workflow agent: the one kind
- * main can start again from a handoff. `handoffAt` is the context percentage it was asked to hand off at.
+ * `canHandOff` marks an agent main can start again from a handoff: one main spawned itself or a /subtask,
+ * fork or not, but no teammate, workflow agent or subagent's own subagent. `handoffAt` is the context
+ * percentage it was asked to hand off at.
  */
 export type AgentRow = {
   id: string
@@ -36,17 +37,32 @@ export type AgentRow = {
 export type HandoffEffort = 'low' | 'medium' | 'high' | 'xhigh' | number
 
 /**
+ * The model and effort every request of one agent runs at (turn.step), as the router chose them for it or
+ * as the agent it continues ran. `model` absent leaves the agent on the model the engine resolved (a fork
+ * on main's, whose prompt cache it then shares); `effort` absent, at its own effort.
+ */
+export type Pin = {
+  agentId: string
+  tier?: 'haiku' | 'sonnet' | 'opus'
+  model?: string
+  effort?: HandoffEffort
+  at: number
+}
+
+/**
  * One subagent asked to hand off because its context passed the threshold, through to the agent that
  * continues its work.
  *
- * `requested`: asked, its run still going. `complete`: its run ended with the task done. `ended`: its run
- * failed or was stopped, which main handles as any failed run. `reported`: it ended with work remaining and
- * `report` holds its handoff whole. `announced`: main has been told to continue it. `continued`:
- * `continuedBy` is the agent carrying on, pinned to `model` and `effort`.
+ * `requested`: asked, its run still going; `deliveredAt` is when the request reached it, beside one of its
+ * tool results. `complete`: its run ended with the task done. `ended`: its run failed or was stopped, which
+ * main handles as any failed run. `reported`: it ended with work remaining and `report` holds its handoff
+ * whole. `announced`: main has been told to continue it, as `continueAs` (`fork`, or an agent type).
+ * `continued`: `continuedBy` is the agent carrying on, pinned to `model` and `effort`.
  */
 export type Handoff = {
   agentId: string
   type: string
+  tier?: 'haiku' | 'sonnet' | 'opus'
   description: string
   model: string
   effort?: HandoffEffort
@@ -54,7 +70,9 @@ export type Handoff = {
   window: number
   at: number
   status: 'requested' | 'complete' | 'ended' | 'reported' | 'announced' | 'continued'
+  deliveredAt?: number
   report?: string
+  continueAs?: string
   continuedBy?: string
 }
 
@@ -73,6 +91,7 @@ declare module 'claude-code' {
       toggle: SessionToggle
       mainContext: MainContext | null
       agents: AgentRow[]
+      pins: Pin[]
       reports: WorkerReport[]
       handoffs: Handoff[]
       isHistoryOpen: boolean

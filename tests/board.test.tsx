@@ -63,7 +63,7 @@ const PANE = {
 test('the band shows the running worker and keeps the finished ones behind a button', async ($, on) => {
   const state: Seed = {
     toggle: { sessionId: 's', enabled: true },
-    mainContext: { tokens: 226_000, window: 1_000_000, percent: 23 },
+    mainContext: { tokens: 226_000, window: 1_000_000, percent: 23, model: 'claude-opus-5-5', effort: 'high' },
     agents: rows,
   }
   on('state.get', ($, e, next) => (e.key in state ? ({ value: { value: state[e.key], version: 1 } } as never) : next(e)))
@@ -74,6 +74,7 @@ test('the band shows the running worker and keeps the finished ones behind a but
     const ui = await $.ui.mount({ ...BAND, surface })
 
     expect((await ui.find({ type: 'Text', text: /model-balance · main/ }))?.text).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /opus-5-5/ }))?.text).toBe('· opus-5-5 · effort high')
     expect((await ui.find({ type: 'Text', text: /sonnet worker/ }))?.text).toContain('Fix the login form')
     expect(await ui.find({ type: 'Text', text: /Refactor the store/ })).toBeUndefined()
 

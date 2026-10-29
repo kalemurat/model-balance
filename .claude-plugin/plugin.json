@@ -1,6 +1,6 @@
 {
   "name": "model-balance",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Spends fewer tokens on the same work: a router picks each prompt's model and effort, and the main conversation answers it or hands it to a Haiku, Sonnet or Opus worker subagent pinned to both, never at max. Main briefs each worker and relays its report, follow-ups continue the last worker, /subtask and forks get a pinned effort, and a board shows the running subagents with the finished ones behind a button. Off at the start of every session, switched on per session.",
   "author": { "name": "Murat KALE" },
   "homepage": "https://github.com/kalemurat/model-balance",

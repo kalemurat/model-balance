@@ -21,7 +21,7 @@ A Claude Code plugin that spends fewer tokens on the same work. A router rates e
 - **Refuses main's own file edits on a routed turn.** `Edit`, `Write` and `NotebookEdit` are denied on a routed turn so that the worker does the work.
 - **Lets workers ask blocking questions.** A worker or a fork can call `mcp__model-balance__ask_user`. It opens one AskUserQuestion dialog with up to four questions and returns the answers.
 - **Shows a board of the subagents.**
-  - It shows the main conversation's context fill.
+  - It shows the main conversation's context fill, and the model and effort its latest request ran at. A `/model` or `/effort` change shows there with the main conversation's next request, as Claude Code offers no way to read the effort before then.
   - It lists every running subagent with its elapsed time, context fill, effort and task. A rated fork shows as `haiku fork`, `sonnet fork` and so on.
   - Finished subagents sit behind a button that shows or hides them.
   - In the terminal and the desktop app the board sits in the band above the prompt. VS Code draws no band, so there it opens in a pane when a worker starts, and the status line names the running worker.
@@ -30,13 +30,14 @@ A Claude Code plugin that spends fewer tokens on the same work. A router rates e
   - Your `autoCompactEnabled` setting is not touched. With routing off, compaction behaves as you configured it.
 - **Hands a long task over before a subagent's context fills.** When a subagent's context passes 65% of its window, it is asked to finish the step under way and end with a handoff report of what was done and everything that remains. The main model then starts a fresh agent on the same model and effort to continue the task; see [Context handoff](#context-handoff).
 - **Starts off in every session.**
-  - Routing is off when a session starts, after `/clear` too.
+  - Routing is off when a session starts, after `/clear` (or `/new`) too. The status line and the board switch off at once, and nothing of the previous conversation (its board, workers' reports or handoffs) carries over.
   - `/model-balance on` turns it on for that session alone; other sessions keep their own setting.
   - A session you resume keeps the choice it had.
 
 **What gets routed.** Routing applies to prompts typed by a person (composer, bridge and SDK origins).
 - Notifications, peer messages, scheduled runs and other plugins' prompts pass through untouched. The one exception: a background agent's notification that carries a handoff gets the main model's continuation note.
 - Prompts shorter than 16 characters and prompts starting with `/` are not routed. `/subtask` is rated as a task instead.
+- The status line says where each prompt went: `→ sonnet · high (sonnet router)`, `→ main (sonnet router)`, `→ main (short prompt)` and so on. Claude Code heads it with the plugin's name.
 
 ## Token use
 
@@ -108,6 +109,7 @@ The plugin is a mod: a hooks module that registers on engine events. This is eve
 | Hook | What it does |
 | --- | --- |
 | `session.start` | Registers the three worker agent types (`model-balance:haiku-worker`, `sonnet-worker`, `opus-worker`) with their models and effort levels, the `mcp__model-balance__ask_user` tool and the `/model-balance` command. Deletes the default for new sessions an earlier version stored. |
+| `classic.SessionStart` for `clear`, `resume` and `fork` | A `/clear` (`/new`) or `/resume` moves the process to another session without a `session.start`. Takes the new session's own on/off (off unless a resumed session was switched on) and shows it on the status line. For `clear` and `resume`, also empties the board, the workers' reports and the handoffs of the conversation that ended. |
 | `command.run` for `/model-balance` | Answers the command itself: switches routing for this session, opens or closes the board's pane, or prints the status or context report. |
 | `command.run` for `/subtask` | While routing is on, rates the task. Appends the agent note after the task's text, so the fork keeps the name Claude Code takes from the task's first words. Holds the model and effort for the fork's first turn. |
 | `prompt.submit` | On a human-typed prompt while routing is on: strips a `#tier` prefix and, unless the router answers MAIN, attaches a routing note to the model's context. On a background agent's notification that carries a handoff: attaches the continuation note. Otherwise the prompt text is passed on as typed; nothing is dropped. |
@@ -118,7 +120,7 @@ The plugin is a mod: a hooks module that registers on engine events. This is eve
 | `tool.call` for `Edit`, `Write`, `NotebookEdit` | Refuses these to the main conversation on a routed turn, except inside the auto-memory directory, so the worker does the editing. The user bypasses this with `#main`. Subagents' calls pass through unchanged. |
 | `tool.call` for `mcp__model-balance__ask_user` | Implements the plugin's own tool. When a worker or a fork calls it, the plugin calls `AskUserQuestion` on its behalf (subagents cannot call it themselves), waits for the dialog and returns the answers as the tool result. This is the only tool the plugin calls itself, and only in answer to an agent's call. |
 | `turn.start` | Starts a subagent's clock on the board, again when SendMessage resumes it. Gives a new agent the model and effort held for it. Puts a `/subtask`'s fork on the board. |
-| `turn.step` | Runs every subagent request on the model and at the effort pinned for it: the router's choice, or the previous agent's for a continuation. Lowers `max` to `xhigh` whoever asked for it. Records each subagent's context fill, model and effort for the board. Marks a subagent past 65% to hand off while routing is on. The main conversation's requests pass unchanged. |
+| `turn.step` | Runs every subagent request on the model and at the effort pinned for it: the router's choice, or the previous agent's for a continuation. Lowers `max` to `xhigh` whoever asked for it. Records each subagent's context fill, model and effort for the board. Marks a subagent past 65% to hand off while routing is on. The main conversation's requests pass unchanged; their model and effort go on main's row of the board. |
 | `turn.complete`, `session.measure` | `turn.complete`: closes a subagent's row on the board, keeps a worker's report for later workers, reads a handoff report for work remaining, and shows a toast when a worker finishes. `session.measure`: records the main conversation's context fill. |
 | `ui.close` | Remembers for the session that the person closed the board's pane, so it does not open again by itself. |
 | `ui.render` for `AbovePrompt` and the `model-balance` pane | Draws the board: in the band above the prompt while routing is on (terminal and desktop app), and in the pane (VS Code, or wherever `/model-balance panel` opens it). |
@@ -155,7 +157,7 @@ claude plugin install model-balance@model-balance
 
 ## Usage
 
-Routing is **off** whenever a session starts, `/clear` included. Turn it on for the current session with `/model-balance on`. Other sessions keep their own setting, and a session you resume keeps the choice it had.
+Routing is **off** whenever a session starts, `/clear` and `/new` included. Turn it on for the current session with `/model-balance on`. Other sessions keep their own setting, and a session you resume keeps the choice it had.
 
 | Command | Effect |
 | --- | --- |

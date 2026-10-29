@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentSpawnInput, AgentSpawnResult, ElementTable, EngineInterface, Register, RenderElement } from 'claude-code'
+import type { AgentSpawnInput, AgentSpawnResult, ElementTable, EngineInterface, ModelEffort, Register, RenderElement } from 'claude-code'
 
 import {
   ASK_TOOL,
@@ -71,6 +71,7 @@ import {
   restartAgent,
   routerChain,
   sessionToggleKey,
+  shortModelName,
   subagentEffortOf,
   tierOfWorker,
   undeliveredHandoffOf,
@@ -283,7 +284,8 @@ const STATUS_MARK: Readonly<Record<AgentRow['status'], { glyph: string; color: s
   stopped: { glyph: '■', color: 'warning' },
 }
 
-const statusText = (isOn: boolean): string => (isOn ? 'model-balance: on' : 'model-balance: off')
+/** The engine heads the status line and every toast with the plugin's name, so these texts leave it out. */
+const statusText = (isOn: boolean): string => (isOn ? 'on' : 'off')
 
 const providerOf = async ($: EngineInterface): Promise<Provider> => {
   if (isSwitchOn(await $.env.get('CLAUDE_CODE_USE_BEDROCK')) || isSwitchOn(await $.env.get('CLAUDE_CODE_USE_MANTLE'))) {
@@ -360,10 +362,15 @@ const isEnabled = async ($: EngineInterface): Promise<boolean> => {
   const { value: held } = await $.state.get(toggleRef)
   if (held?.sessionId === sessionId) return held.enabled
 
+  // Reached at start, and on a new session id the classic SessionStart hook did not adopt first.
+  return adoptSession($, sessionId)
+}
+
+/** Takes `sessionId`'s own saved choice, off when it has none, as the live answer and the status line. */
+const adoptSession = async ($: EngineInterface, sessionId: string): Promise<boolean> => {
   const enabled = readSavedToggle(await $.store.get(sessionToggleKey(sessionId)))?.enabled ?? false
   const toggle: SessionToggle = { sessionId, enabled }
   await $.state.set(toggleRef, toggle)
-  // Reached on a new session id (/clear, /resume in the same process) as well as at start.
   $.ui.status(statusText(enabled))
 
   return enabled
@@ -383,6 +390,30 @@ const pruneSavedToggles = async ($: EngineInterface): Promise<void> => {
   for (const key of await $.store.keys()) {
     if (key === LEGACY_DEFAULT_KEY || isStaleSessionToggle(key, await $.store.get(key), now)) await $.store.delete(key)
   }
+}
+
+/** Main's row as a conversation starts: its context as measured now, on the session's model; its effort comes with its first request. */
+const measureMain = async ($: EngineInterface): Promise<void> => {
+  const { context } = await $.session.usage()
+  const model = await $.session.model()
+  await update($, mainContextAtom, () => ({ tokens: context.tokens, window: context.window, percent: context.percent, model }))
+}
+
+/**
+ * Keeps main's row on the model and effort its latest request runs at. No op reads the session's effort, and
+ * a /model or /effort change shows only in main's next request, so the row follows that. Written only on a
+ * change, as each write redraws the board.
+ */
+const noteMainRequest = async ($: EngineInterface, model: string, effort: ModelEffort | number | undefined): Promise<void> => {
+  const level = effort === undefined ? undefined : String(effort)
+  const held = await read($, mainContextAtom)
+  if (held !== null && held.model === model && held.effort === level) return
+
+  await update($, mainContextAtom, main => {
+    const { effort: _effort, ...rest } = main ?? { window: 0 }
+
+    return { ...rest, model, ...(level === undefined ? {} : { effort: level }) }
+  })
 }
 
 const lastWorkerBlock = (worker: LastWorker): string =>
@@ -663,6 +694,11 @@ const drawBoard = (
           ) : (
             <Text color={contextColor(mainPercent)}>{figures(main.tokens, main.window, mainPercent)}</Text>
           )}
+          {main.model === undefined ? null : (
+            <Text dimColor>
+              {`· ${shortModelName(main.model)}${main.effort === undefined ? '' : ` · effort ${main.effort}`}`}
+            </Text>
+          )}
         </Box>
       )}
       {running.map(agentRow)}
@@ -741,8 +777,7 @@ export const register: Register = (on, options) => {
     })
     $.ui.status(statusText(await isEnabled($)))
     try {
-      const { context } = await $.session.usage()
-      await update($, mainContextAtom, () => ({ tokens: context.tokens, window: context.window, percent: context.percent }))
+      await measureMain($)
     } catch {
       // The band shows no main bar until the first measurement; nothing else depends on it.
     }
@@ -762,6 +797,37 @@ export const register: Register = (on, options) => {
 
     return next(e)
   })
+
+  /**
+   * A /clear (/new is the same command) or a /resume moves the process to another conversation without a
+   * `session.start` (SessionEndInput: "no `session.start` fires for it"); the classic SessionStart hook fires
+   * for it, with the new session's id. The new conversation starts off unless it is a resumed one that was
+   * switched on, and nothing of the last one reaches it: not its board, nor its workers' reports, which a new
+   * worker would read as its own session's record, nor its handoffs, which a spawn of the same type would take up.
+   * A fork of the conversation is a new session too, so it starts off, but it keeps the record it carries on.
+   */
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'startup' || e.source === 'compact') return next(e)
+    await adoptSession($, e.session_id)
+    if (e.source === 'fork') return next(e)
+
+    workers.clear()
+    workerTasks.clear()
+    lastWorkerId = undefined
+    routed = undefined
+    pending.length = 0
+    await update($, agentsAtom, () => [])
+    await update($, reportsAtom, () => [])
+    await update($, handoffsAtom, () => [])
+    await update($, historyOpenAtom, () => false)
+    await update($, paneDismissedAtom, () => false)
+    await measureMain($)
+
+    return next(e)
+  }).catch(($, e, next) =>
+    // The next prompt still finds the new session id (isEnabled) and starts it off; only the board may lag.
+    next(e),
+  )
 
   on('command.run', { command: 'model-balance' }, async ($, e) => {
     const onOff = (isOn: boolean): string => (isOn ? 'on' : 'off')
@@ -837,15 +903,22 @@ export const register: Register = (on, options) => {
 
     const { override, effort: overrideEffort, rest } = readOverride(e.text)
     if (override === 'main') {
-      $.ui.status('model-balance → main (#main)')
+      $.ui.status('→ main (#main)')
 
       return next({ ...e, text: rest })
     }
-    if (override === undefined && !isWorthRouting(e.text)) return next(e)
+    if (override === undefined && !isWorthRouting(e.text)) {
+      // A short follow-up says why the router was not asked, so the line does not keep the last verdict.
+      if (!e.text.trimStart().startsWith('/')) $.ui.status('→ main (short prompt)')
+
+      return next(e)
+    }
 
     const text = override === undefined ? e.text : rest
     const agents = await $.agent.list()
-    const lastAgent = pickLastWorker(agents, lastWorkerId)
+    // Only a worker of this conversation is continued: its board is emptied with the conversation (/clear, /resume).
+    const onBoard = new Set((await read($, agentsAtom)).map(row => row.id))
+    const lastAgent = pickLastWorker(agents.filter(agent => onBoard.has(agent.id)), lastWorkerId)
     const last = lastAgent === undefined ? undefined : toLastWorker(lastAgent, workerTasks.get(lastAgent.id))
     const runningAgent = agents.find(agent => isTopLevelWorker(agent) && isActiveStatus(agent.status))
     const running = runningAgent === undefined ? undefined : toLastWorker(runningAgent, workerTasks.get(runningAgent.id))
@@ -857,32 +930,32 @@ export const register: Register = (on, options) => {
 
     // Answerable from the conversation itself: main answers, with no note and no worker.
     if (verdict.route === 'main') {
-      $.ui.status(`model-balance → main (${verdict.by})`)
+      $.ui.status(`→ main (${verdict.by})`)
 
       return next({ ...e, text })
     }
     const tier = verdict.route
 
     if (verdict.isContinuation && last !== undefined && (running === undefined || running.id === last.id)) {
-      $.ui.status(`model-balance → continue ${last.tier} worker (${verdict.by})`)
+      $.ui.status(`→ continue ${last.tier} worker (${verdict.by})`)
 
       return next({ ...e, text, context: [...(e.context ?? []), continueNote(last, verdict.by)] })
     }
     if (running !== undefined) {
-      $.ui.status(`model-balance → on hold: ${running.tier} worker still running`)
+      $.ui.status(`→ on hold: ${running.tier} worker still running`)
 
       return next({ ...e, text, context: [...(e.context ?? []), waitNote(running)] })
     }
 
     const effort = effortFor(tier, verdict.effort)
     routed = { tier, ...(effort === undefined ? {} : { effort }), by: verdict.by }
-    $.ui.status(`model-balance → ${tier}${effort === undefined ? '' : ` · ${effort}`} (${verdict.by})`)
+    $.ui.status(`→ ${tier}${effort === undefined ? '' : ` · ${effort}`} (${verdict.by})`)
 
     return next({ ...e, text, context: [...(e.context ?? []), spawnNote(routed)] })
   }).catch(($, e, next) => {
     // The router failing must never cost the person their prompt: it goes to main as typed. This build types
     // `kind` without `re-entry`, which the docs still list for a skipped re-entrant dispatch.
-    if ((next.error.kind as string) !== 're-entry') $.ui.status('model-balance → main (router failed)')
+    if ((next.error.kind as string) !== 're-entry') $.ui.status('→ main (router failed)')
 
     return next(e)
   })
@@ -900,7 +973,7 @@ export const register: Register = (on, options) => {
     const pin = await forkPinOf($, rated.tier, effortFor(rated.tier, rated.effort))
     const args = `${e.args.trimEnd()}\n\n${agentNotice(pin)}`
     addPending(pending, args, pin, await $.clock.now())
-    $.ui.status(`model-balance → /subtask on ${pinText(pin)} (${rated.by})`)
+    $.ui.status(`→ /subtask on ${pinText(pin)} (${rated.by})`)
 
     return next({ ...e, args })
   }).catch(($, e, next) =>
@@ -1003,7 +1076,7 @@ export const register: Register = (on, options) => {
       }
       if (continuation !== undefined) {
         await update($, handoffsAtom, list => patchHandoff(list, continuation.agentId, { status: 'continued', continuedBy: agentId }))
-        $.ui.toast(`model-balance: ${handoffLabel(continuation)} ${agentId} continues the handoff of ${continuation.agentId}`)
+        $.ui.toast(`${handoffLabel(continuation)} ${agentId} continues the handoff of ${continuation.agentId}`)
       }
     } catch {
       // The pin was taken at the agent's first turn, or its requests run as the engine resolved them.
@@ -1013,7 +1086,7 @@ export const register: Register = (on, options) => {
       workers.set(agentId, tier)
       lastWorkerId = agentId
       rememberLatest(workerTasks, agentId, e.prompt, BOARD_AGENTS)
-      $.ui.status(`model-balance ▶ ${tier} worker: ${e.description}`)
+      $.ui.status(`▶ ${tier} worker: ${e.description}`)
       try {
         await openPaneInEditor($)
       } catch {
@@ -1075,7 +1148,7 @@ export const register: Register = (on, options) => {
 
     const now = await $.clock.now()
     await update($, handoffsAtom, list => patchHandoff(list, agentId, { deliveredAt: now }))
-    $.ui.toast(`model-balance: ${handoffLabel(handoff)} at ${percentOf(handoff.tokens, handoff.window)}% context, asked to hand off`)
+    $.ui.toast(`${handoffLabel(handoff)} at ${percentOf(handoff.tokens, handoff.window)}% context, asked to hand off`)
 
     return { ...called, context: [...(called.context ?? []), handoffRequest(handoff)] }
   }).catch(($, e, next) =>
@@ -1204,7 +1277,15 @@ export const register: Register = (on, options) => {
    * handoff point is marked to hand off while routing is on.
    */
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined) return yield* next(e)
+    if (e.agentId === undefined) {
+      try {
+        await noteMainRequest($, e.model, e.effort)
+      } catch {
+        // Main's row keeps the model and effort it showed; the request is unaffected.
+      }
+
+      return yield* next(e)
+    }
 
     const agentId = e.agentId
     let pin: Pin | undefined
@@ -1288,7 +1369,8 @@ export const register: Register = (on, options) => {
           }),
         )
 
-        if (tier !== undefined) {
+        // A worker off the board belongs to a conversation that ended (/clear, /resume): its report is not this one's record.
+        if (tier !== undefined && row !== undefined) {
           workers.delete(agentId)
           const answer = e.answer.trim()
           if (answer !== '') {
@@ -1314,7 +1396,7 @@ export const register: Register = (on, options) => {
               : ` · context ${formatTokens(row.contextTokens)} (${percentOf(row.contextTokens, row.window)}%)`
           const output = e.usage === undefined ? '' : ` · out ${formatTokens(e.usage.output_tokens)}`
           const label = agentLabel({ tier, type: row?.type ?? workerType(tier) })
-          $.ui.toast(`model-balance: ${label} ${status === 'done' ? 'finished' : status} in ${seconds}${context}${output}`)
+          $.ui.toast(`${label} ${status === 'done' ? 'finished' : status} in ${seconds}${context}${output}`)
           $.ui.status(statusText(await isEnabled($)))
         }
       } catch {
@@ -1328,7 +1410,8 @@ export const register: Register = (on, options) => {
   /** Pushed by the engine after each main-thread turn: no polling, the band redraws on the write. */
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('context')) {
-      await update($, mainContextAtom, () => ({
+      await update($, mainContextAtom, main => ({
+        ...main,
         tokens: e.context.tokens,
         window: e.context.window,
         percent: e.context.percent,

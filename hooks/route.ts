@@ -580,6 +580,9 @@ export const FORK_TYPE = 'fork'
 export const agentLabel = (row: Pick<AgentRow, 'tier' | 'type'>): string =>
   row.tier === undefined ? row.type.replace(/^model-balance:/, '') : `${row.tier} ${row.type === FORK_TYPE ? 'fork' : 'worker'}`
 
+/** A model id as the board names it: `claude-opus-5-5[1m]` → `opus-5-5[1m]`, a provider's prefix (`us.anthropic.`) dropped too. */
+export const shortModelName = (model: string): string => model.replace(/^.*?claude-/i, '')
+
 /**
  * Up to how many tokens of main's context a fork is moved to a cheaper model than main's. A fork on main's
  * model reads main's context from the prompt cache main already paid for; on another model its first

@@ -27,9 +27,12 @@ const session = (on: On, options: { enabled?: boolean; reply?: string; mainToken
   on('store.delete', (_, e) => (deleted.push(e.key), store.delete(e.key), { value: undefined }) as never)
   mock.env(on, {})
   mock.clock(on, { now: 1000 })
-  on('ui.status', () => ({ value: undefined }))
+  const statuses: (string | undefined)[] = []
+  on('ui.status', (_, e) => (statuses.push(e.text), { value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
-  on('session.id', () => ({ value: 's-1' }))
+  // The session the process runs under: a /clear moves it to another.
+  const ids = { session: 's-1' }
+  on('session.id', () => ({ value: ids.session }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.messages', () => ({ value: [] }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 } } }) as never)
@@ -84,6 +87,8 @@ const session = (on: On, options: { enabled?: boolean; reply?: string; mainToken
 
   return {
     world,
+    ids,
+    statuses,
     agents,
     rated,
     prompts,
@@ -240,4 +245,65 @@ test('past the limit the router is not told to keep small changes in main', asyn
   const large = session(on, { reply: 'HAIKU LOW NEW', mainTokens: 400_000 })
   expect(noteOf(await prompt($, 'Add a docstring to the add function in calc.py.'))).toContain('HAIKU at effort LOW')
   expect(large.rated.at(-1)).not.toContain('<main_context')
+})
+
+test('a /clear starts the next conversation off, with nothing of the last one on the board or in a worker prompt', async ($, on) => {
+  const world = session(on)
+  on('classic.SessionStart', () => ({}))
+  await prompt($, 'Fix the validation bug in the login form, the email field accepts spaces.')
+  await $.agent.spawn(spawnOf())
+  await $.turn.complete({ answer: '## Result: the login form is fixed.', durationMs: 1, isAborted: false, turnId: 't-a-1', agentId: 'a-1', reason: 'answer' })
+  expect(world.stored.get('reports')).toHaveLength(1)
+
+  world.ids.session = 's-2'
+  await $.classic.SessionStart({ source: 'clear', session_id: 's-2' })
+  expect(world.stored.get('toggle')).toEqual({ sessionId: 's-2', enabled: false })
+  // The engine heads the line with the plugin's name itself.
+  expect(world.statuses.at(-1)).toBe('off')
+  expect(world.rows()).toEqual([])
+  expect(world.stored.get('reports')).toEqual([])
+  expect(noteOf(await prompt($, 'Fix the validation bug in the signup form, the name field accepts digits.'))).toBe('')
+
+  await $.command.run({ command: 'model-balance', args: 'on', origin: { kind: 'composer' }, presentation: PRESENTATION })
+  world.agents.push({ id: 'a-1', type: 'model-balance:sonnet-worker', status: 'completed', description: 'Fix the login form' })
+  const note = noteOf(await prompt($, 'Fix the validation bug in the signup form, the name field accepts digits.'))
+  // The last conversation's worker is not offered to the router as one to continue.
+  expect(world.rated.at(-1)).not.toContain('<last_worker')
+  expect(note).toContain('subagent_type "model-balance:sonnet-worker"')
+  await $.agent.spawn(spawnOf({ prompt: 'Fix the signup form.' }))
+  expect(world.spawns.at(-1)!.prompt).not.toContain('<earlier_workers>')
+})
+
+test('a resumed session keeps its own choice', async ($, on) => {
+  const world = session(on, { store: { [sessionToggleKey('s-old')]: { enabled: true, at: 1000 } } })
+  on('classic.SessionStart', () => ({}))
+  world.ids.session = 's-old'
+  await $.classic.SessionStart({ source: 'resume', session_id: 's-old' })
+  expect(world.stored.get('toggle')).toEqual({ sessionId: 's-old', enabled: true })
+  expect(world.statuses.at(-1)).toBe('on')
+})
+
+test("main's row follows the model and effort of main's latest request", async ($, on) => {
+  const world = session(on)
+  const mainStep = async (model: string, effort: TurnStepInput['effort']): Promise<void> => {
+    const stream = $.turn.step({ turnId: 't-main', index: 0, model, ...(effort === undefined ? {} : { effort }), messageCount: 4 })
+    for await (const _ of stream) {
+      // Answered whole at the bottom.
+    }
+    await stream.result
+  }
+
+  await mainStep('claude-opus-5-5', 'high')
+  expect(world.stored.get('mainContext')).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' })
+  await mainStep('claude-sonnet-5-5', 'low')
+  expect(world.stored.get('mainContext')).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'low' })
+  // Main's own request is never rewritten.
+  expect(world.requests.at(-1)).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'low' })
+})
+
+test('a short follow-up tells the status line it stayed in main', async ($, on) => {
+  const world = session(on)
+  await prompt($, 'merge et')
+  expect(world.rated).toHaveLength(0)
+  expect(world.statuses.at(-1)).toBe('→ main (short prompt)')
 })

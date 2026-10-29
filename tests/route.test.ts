@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  shortModelName,
   DEFAULT_WORKER_EFFORT,
   agentLabel,
   cappedSubagentEffort,
@@ -653,4 +654,11 @@ test('a fork is continued in a fresh agent of its tier; the request goes out onc
   expect(note).toContain('subagent_type "model-balance:sonnet-worker"')
   expect(note).toContain("/subtask's text")
   expect(note).toContain('sonnet fork a-1')
+})
+
+test('the board names a model without its claude- prefix', () => {
+  expect(shortModelName('claude-opus-5-5')).toBe('opus-5-5')
+  expect(shortModelName('claude-opus-5-5[1m]')).toBe('opus-5-5[1m]')
+  expect(shortModelName('us.anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('haiku-4-5-20251001-v1:0')
+  expect(shortModelName('sonnet')).toBe('sonnet')
 })

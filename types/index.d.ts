@@ -4,8 +4,12 @@
  */
 export type SessionToggle = { sessionId: string; enabled: boolean }
 
-/** The main conversation's context fill as the engine last measured it; `tokens` is absent until a response of the live window came back. */
-export type MainContext = { tokens?: number; window: number; percent?: number }
+/**
+ * The main conversation's context fill as the engine last measured it; `tokens` is absent until a response of
+ * the live window came back. `model` and `effort` are what main's latest request ran at (turn.step), the
+ * session's model standing in before its first; `effort` is absent for a model without one.
+ */
+export type MainContext = { tokens?: number; window: number; percent?: number; model?: string; effort?: string }
 
 /**
  * One subagent of this session as the board shows it, the latest run of it: a resume through SendMessage
